@@ -64,6 +64,12 @@ in
 
         audit = craneLib.cargoAudit {
           inherit src advisory-db;
+          # sqlx declares sqlx-mysql and sqlx-postgres as optional dependencies,
+          # so rsa is recorded in Cargo.lock even though only the SQLite driver
+          # is enabled. cargo-audit scans the whole lockfile, so it flags the rsa
+          # Marvin attack (RUSTSEC-2023-0071); rsa is never compiled or linked
+          # here. --ignore yanked avoids offline crates.io index lookups.
+          cargoAuditExtraArgs = "--ignore yanked --ignore RUSTSEC-2023-0071";
         };
 
         deny = craneLib.cargoDeny {
