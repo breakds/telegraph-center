@@ -142,6 +142,13 @@ impl AppConfig {
         raw.validate()
     }
 
+    /// Find the configured Client whose certificate fingerprint matches.
+    pub fn client_by_fingerprint(&self, fingerprint: &str) -> Option<&ClientConfig> {
+        self.clients
+            .iter()
+            .find(|client| client.certificate_fingerprint == fingerprint)
+    }
+
     /// The ordered Routing Rules derived from configured Sinks.
     pub fn routing_rules(&self) -> Vec<RoutingRule> {
         self.sinks

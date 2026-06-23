@@ -6,6 +6,9 @@
 //! SQLite persistence) is testable without HTTP, transcription, or webhook
 //! delivery. Later milestones add the HTTP API, workers, and monitor UI.
 
+pub mod blob;
 pub mod config;
 pub mod domain;
+pub mod http;
 pub mod storage;
+pub mod wav;

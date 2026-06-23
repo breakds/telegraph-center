@@ -14,9 +14,17 @@ sqlx = { version = "0.8", default-features = false, features = [
   "migrate",
   "macros",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "fs",
+  "io-util",
+] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 thiserror = "2"
+axum = { version = "0.8", features = ["multipart"] }
+ulid = "1"
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

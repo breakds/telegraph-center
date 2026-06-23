@@ -19,7 +19,15 @@ in
     let
       craneLib = crane.mkLib pkgs-dev;
 
-      src = craneLib.cleanCargoSource ../.;
+      # Keep the usual Cargo sources, plus SQL migrations: sqlx::migrate!()
+      # embeds them at compile time, so they must be present in the build src.
+      src = lib.cleanSourceWith {
+        src = ../.;
+        name = "source";
+        filter =
+          path: type:
+          (lib.hasSuffix ".sql" path) || (craneLib.filterCargoSources path type);
+      };
       hasCargoToml = builtins.pathExists ../Cargo.toml;
 
       commonArgs = {
