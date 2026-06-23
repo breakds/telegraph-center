@@ -10,5 +10,7 @@ pub mod blob;
 pub mod config;
 pub mod domain;
 pub mod http;
+pub mod seam;
 pub mod storage;
 pub mod wav;
+pub mod workers;

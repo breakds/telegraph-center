@@ -12,43 +12,12 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::post;
-use time::OffsetDateTime;
 
 use crate::blob::BlobStore;
 use crate::config::AppConfig;
 use crate::storage::SqliteStore;
 
-/// Source of wall-clock time, injectable for deterministic tests.
-pub trait Clock: Send + Sync {
-    /// The current time in UTC.
-    fn now(&self) -> OffsetDateTime;
-}
-
-/// Production clock backed by the system clock.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc()
-    }
-}
-
-/// Source of server-generated Recording identifiers, injectable for tests.
-pub trait IdGenerator: Send + Sync {
-    /// A fresh, stable identifier.
-    fn generate(&self) -> String;
-}
-
-/// Production identifier generator producing lexicographically sortable ULIDs.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct UlidGenerator;
-
-impl IdGenerator for UlidGenerator {
-    fn generate(&self) -> String {
-        ulid::Ulid::new().to_string()
-    }
-}
+pub use crate::seam::{Clock, IdGenerator, SystemClock, UlidGenerator};
 
 /// Shared state for the Client API. Cheap to clone.
 #[derive(Clone)]

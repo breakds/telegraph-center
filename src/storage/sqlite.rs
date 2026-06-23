@@ -17,8 +17,9 @@ use crate::domain::{
 };
 
 use super::{
-    NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure, NewOperatorSession,
-    NewRecording, NewTranscript, NewTranscriptionAttempt, RecordingCreation, StorageError,
+    DeliveryCandidate, NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure,
+    NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt, RecordingCreation,
+    StorageError, TranscriptionAttemptStart, TranscriptionRetryCandidate,
 };
 
 /// A SQLite-backed store. Cloning shares the underlying connection pool.
@@ -158,25 +159,8 @@ impl SqliteStore {
     /// Store a Transcript and move the Recording from `transcribing` to
     /// `routing` in a single transaction.
     pub async fn store_transcript(&self, new: NewTranscript) -> Result<Transcript, StorageError> {
-        let created = timestamp::format(new.created_at);
         let mut tx = self.pool.begin().await?;
-
-        sqlx::query(
-            "INSERT INTO transcripts (
-                 recording_id, provider, text, raw_json,
-                 provider_file_id, provider_transcription_id, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&new.recording_id)
-        .bind(&new.provider)
-        .bind(&new.text)
-        .bind(&new.raw_json)
-        .bind(new.provider_file_id.as_deref())
-        .bind(new.provider_transcription_id.as_deref())
-        .bind(&created)
-        .execute(&mut *tx)
-        .await?;
-
+        insert_transcript(&mut tx, &new).await?;
         guarded_transition(
             &mut tx,
             &new.recording_id,
@@ -590,6 +574,426 @@ impl SqliteStore {
         rows.into_iter().map(AuditEventRow::into_domain).collect()
     }
 
+    // -- Transcription work queue -------------------------------------------
+
+    /// Atomically claim the oldest `received` Recording, moving it to
+    /// `transcribing`. This is the claim for a Recording's first Transcription.
+    pub async fn claim_received_for_transcription(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<Option<Recording>, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM recordings WHERE status = 'received'
+             ORDER BY received_at, created_at LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(id) = id else {
+            return Ok(None);
+        };
+
+        guarded_transition(&mut tx, &id, RecordingStatus::Transcribing, now).await?;
+        tx.commit().await?;
+        Ok(Some(self.require_recording(&id).await?))
+    }
+
+    /// List `transcribing` Recordings that have a finished Transcription Attempt
+    /// and no in-flight one, oldest first. Whether each is actually due for
+    /// retry is decided by the caller's retry policy.
+    pub async fn transcription_retry_candidates(
+        &self,
+    ) -> Result<Vec<TranscriptionRetryCandidate>, StorageError> {
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT r.id,
+                    (SELECT MAX(attempt_number) FROM transcription_attempts a
+                       WHERE a.recording_id = r.id),
+                    (SELECT finished_at FROM transcription_attempts a
+                       WHERE a.recording_id = r.id
+                       ORDER BY attempt_number DESC LIMIT 1)
+             FROM recordings r
+             WHERE r.status = 'transcribing'
+               AND EXISTS (SELECT 1 FROM transcription_attempts a
+                             WHERE a.recording_id = r.id)
+               AND NOT EXISTS (SELECT 1 FROM transcription_attempts a
+                                 WHERE a.recording_id = r.id AND a.finished_at IS NULL)
+             ORDER BY r.received_at, r.created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (recording_id, last_attempt_number, last_finished) in rows {
+            let recording = self.require_recording(&recording_id).await?;
+            candidates.push(TranscriptionRetryCandidate {
+                recording,
+                last_attempt_number,
+                last_attempt_finished_at: parse_ts(&last_finished)?,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Insert an in-flight Transcription Attempt as the work claim, unless one
+    /// is already in flight. Returns `None` if the claim was lost.
+    pub async fn start_transcription_attempt(
+        &self,
+        attempt_id: &str,
+        recording_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<TranscriptionAttemptStart>, StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        let in_flight: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM transcription_attempts
+             WHERE recording_id = ? AND finished_at IS NULL LIMIT 1",
+        )
+        .bind(recording_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if in_flight.is_some() {
+            return Ok(None);
+        }
+
+        let attempt_number: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM transcription_attempts
+             WHERE recording_id = ?",
+        )
+        .bind(recording_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let started = timestamp::format(now);
+        sqlx::query(
+            "INSERT INTO transcription_attempts
+                 (id, recording_id, attempt_number, started_at, finished_at, status, retryable)
+             VALUES (?, ?, ?, ?, NULL, 'in_progress', 0)",
+        )
+        .bind(attempt_id)
+        .bind(recording_id)
+        .bind(attempt_number)
+        .bind(&started)
+        .execute(&mut *tx)
+        .await?;
+
+        let first_started: String = sqlx::query_scalar(
+            "SELECT MIN(started_at) FROM transcription_attempts WHERE recording_id = ?",
+        )
+        .bind(recording_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(TranscriptionAttemptStart {
+            attempt_number,
+            first_started_at: parse_ts(&first_started)?,
+        }))
+    }
+
+    /// Finish an in-flight Transcription Attempt successfully, store the
+    /// Transcript, and move the Recording to `routing`.
+    pub async fn succeed_transcription(
+        &self,
+        attempt_id: &str,
+        finished_at: OffsetDateTime,
+        transcript: NewTranscript,
+    ) -> Result<Transcript, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        finish_transcription_attempt(
+            &mut tx,
+            attempt_id,
+            finished_at,
+            "succeeded",
+            false,
+            None,
+            None,
+        )
+        .await?;
+        insert_transcript(&mut tx, &transcript).await?;
+        guarded_transition(
+            &mut tx,
+            &transcript.recording_id,
+            RecordingStatus::Routing,
+            finished_at,
+        )
+        .await?;
+        tx.commit().await?;
+        self.require_transcript(&transcript.recording_id).await
+    }
+
+    /// Finish an in-flight Transcription Attempt as a retryable failure, leaving
+    /// the Recording in `transcribing` and surfacing `latest_error`.
+    pub async fn retry_transcription(
+        &self,
+        attempt_id: &str,
+        recording_id: &str,
+        finished_at: OffsetDateTime,
+        code: &str,
+        message: &str,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
+        finish_transcription_attempt(
+            &mut tx,
+            attempt_id,
+            finished_at,
+            "failed",
+            true,
+            Some(code),
+            Some(message),
+        )
+        .await?;
+        set_recording_error(&mut tx, recording_id, finished_at, message).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Finish an in-flight Transcription Attempt as a terminal failure, moving
+    /// the Recording to `transcription_failed`.
+    pub async fn fail_transcription(
+        &self,
+        attempt_id: &str,
+        recording_id: &str,
+        finished_at: OffsetDateTime,
+        code: &str,
+        message: &str,
+    ) -> Result<Recording, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        finish_transcription_attempt(
+            &mut tx,
+            attempt_id,
+            finished_at,
+            "failed",
+            false,
+            Some(code),
+            Some(message),
+        )
+        .await?;
+        set_recording_error(&mut tx, recording_id, finished_at, message).await?;
+        guarded_transition(
+            &mut tx,
+            recording_id,
+            RecordingStatus::TranscriptionFailed,
+            finished_at,
+        )
+        .await?;
+        tx.commit().await?;
+        self.require_recording(recording_id).await
+    }
+
+    // -- Routing work queue -------------------------------------------------
+
+    /// Fetch the oldest Recording awaiting Routing. The actual state change is
+    /// performed by `select_sink` or `mark_backlogged`, which guard against a
+    /// concurrent worker handling the same Recording.
+    pub async fn claim_routing_candidate(&self) -> Result<Option<Recording>, StorageError> {
+        let id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM recordings WHERE status = 'routing'
+             ORDER BY received_at, created_at LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        match id {
+            Some(id) => Ok(Some(self.require_recording(&id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    // -- Delivery work queue ------------------------------------------------
+
+    /// List `delivering` Deliveries with no in-flight Delivery Attempt, oldest
+    /// selection first, with the Recording and Transcript needed to deliver.
+    pub async fn delivery_candidates(&self) -> Result<Vec<DeliveryCandidate>, StorageError> {
+        let rows: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT d.id,
+                    (SELECT MAX(attempt_number) FROM delivery_attempts a
+                       WHERE a.delivery_id = d.id),
+                    (SELECT finished_at FROM delivery_attempts a
+                       WHERE a.delivery_id = d.id
+                       ORDER BY attempt_number DESC LIMIT 1)
+             FROM deliveries d
+             WHERE d.status = 'delivering'
+               AND NOT EXISTS (SELECT 1 FROM delivery_attempts a
+                                 WHERE a.delivery_id = d.id AND a.finished_at IS NULL)
+             ORDER BY d.selected_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (delivery_id, last_attempt_number, last_finished) in rows {
+            let delivery = self.require_delivery(&delivery_id).await?;
+            let recording = self.require_recording(&delivery.recording_id).await?;
+            let transcript = self.require_transcript(&delivery.recording_id).await?;
+            candidates.push(DeliveryCandidate {
+                delivery,
+                recording,
+                transcript,
+                last_attempt_number,
+                last_attempt_finished_at: parse_ts_opt(last_finished)?,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Insert an in-flight Delivery Attempt as the work claim, unless one is
+    /// already in flight. Returns the new attempt number, or `None` if lost.
+    pub async fn start_delivery_attempt(
+        &self,
+        attempt_id: &str,
+        delivery_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<i64>, StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        let in_flight: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM delivery_attempts
+             WHERE delivery_id = ? AND finished_at IS NULL LIMIT 1",
+        )
+        .bind(delivery_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if in_flight.is_some() {
+            return Ok(None);
+        }
+
+        let attempt_number: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM delivery_attempts
+             WHERE delivery_id = ?",
+        )
+        .bind(delivery_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO delivery_attempts
+                 (id, delivery_id, attempt_number, started_at, finished_at, status, retryable)
+             VALUES (?, ?, ?, ?, NULL, 'in_progress', 0)",
+        )
+        .bind(attempt_id)
+        .bind(delivery_id)
+        .bind(attempt_number)
+        .bind(timestamp::format(now))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(attempt_number))
+    }
+
+    /// Finish an in-flight Delivery Attempt successfully and move the Delivery
+    /// and Recording to `delivered`.
+    pub async fn succeed_delivery(
+        &self,
+        attempt_id: &str,
+        delivery_id: &str,
+        finished_at: OffsetDateTime,
+        http_status: Option<i64>,
+    ) -> Result<Delivery, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let recording_id = recording_id_for_delivery(&mut tx, delivery_id).await?;
+        finish_delivery_attempt(
+            &mut tx,
+            attempt_id,
+            finished_at,
+            "succeeded",
+            false,
+            http_status,
+            None,
+        )
+        .await?;
+        sqlx::query("UPDATE deliveries SET status = ?, completed_at = ? WHERE id = ?")
+            .bind(DeliveryStatus::Delivered.as_str())
+            .bind(timestamp::format(finished_at))
+            .bind(delivery_id)
+            .execute(&mut *tx)
+            .await?;
+        guarded_transition(
+            &mut tx,
+            &recording_id,
+            RecordingStatus::Delivered,
+            finished_at,
+        )
+        .await?;
+        tx.commit().await?;
+        self.require_delivery(delivery_id).await
+    }
+
+    /// Finish an in-flight Delivery Attempt as a retryable failure, leaving the
+    /// Delivery and Recording in `delivering` and surfacing `latest_error`.
+    pub async fn retry_delivery(
+        &self,
+        attempt_id: &str,
+        delivery_id: &str,
+        finished_at: OffsetDateTime,
+        http_status: Option<i64>,
+        message: &str,
+    ) -> Result<(), StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let recording_id = recording_id_for_delivery(&mut tx, delivery_id).await?;
+        finish_delivery_attempt(
+            &mut tx,
+            attempt_id,
+            finished_at,
+            "failed",
+            true,
+            http_status,
+            Some(message),
+        )
+        .await?;
+        sqlx::query("UPDATE deliveries SET latest_error = ? WHERE id = ?")
+            .bind(message)
+            .bind(delivery_id)
+            .execute(&mut *tx)
+            .await?;
+        set_recording_error(&mut tx, &recording_id, finished_at, message).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Finish an in-flight Delivery Attempt as a terminal failure, moving the
+    /// Delivery and Recording to `delivery_failed`.
+    pub async fn fail_delivery(
+        &self,
+        attempt_id: &str,
+        delivery_id: &str,
+        finished_at: OffsetDateTime,
+        http_status: Option<i64>,
+        message: &str,
+    ) -> Result<Delivery, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let recording_id = recording_id_for_delivery(&mut tx, delivery_id).await?;
+        finish_delivery_attempt(
+            &mut tx,
+            attempt_id,
+            finished_at,
+            "failed",
+            false,
+            http_status,
+            Some(message),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE deliveries SET status = ?, completed_at = ?, latest_error = ? WHERE id = ?",
+        )
+        .bind(DeliveryStatus::DeliveryFailed.as_str())
+        .bind(timestamp::format(finished_at))
+        .bind(message)
+        .bind(delivery_id)
+        .execute(&mut *tx)
+        .await?;
+        set_recording_error(&mut tx, &recording_id, finished_at, message).await?;
+        guarded_transition(
+            &mut tx,
+            &recording_id,
+            RecordingStatus::DeliveryFailed,
+            finished_at,
+        )
+        .await?;
+        tx.commit().await?;
+        self.require_delivery(delivery_id).await
+    }
+
     // -- Internal helpers ---------------------------------------------------
 
     async fn require_recording(&self, id: &str) -> Result<Recording, StorageError> {
@@ -636,6 +1040,110 @@ async fn guarded_transition(
         .execute(&mut *conn)
         .await?;
     Ok(())
+}
+
+/// Update a Recording's `latest_error` and `updated_at` without changing status.
+async fn set_recording_error(
+    conn: &mut SqliteConnection,
+    recording_id: &str,
+    at: OffsetDateTime,
+    message: &str,
+) -> Result<(), StorageError> {
+    sqlx::query("UPDATE recordings SET latest_error = ?, updated_at = ? WHERE id = ?")
+        .bind(message)
+        .bind(timestamp::format(at))
+        .bind(recording_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Finish an in-flight Transcription Attempt (the row with `finished_at IS NULL`).
+async fn finish_transcription_attempt(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+    finished_at: OffsetDateTime,
+    status: &str,
+    retryable: bool,
+    error_code: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "UPDATE transcription_attempts
+         SET finished_at = ?, status = ?, retryable = ?, error_code = ?, error_message = ?
+         WHERE id = ?",
+    )
+    .bind(timestamp::format(finished_at))
+    .bind(status)
+    .bind(retryable)
+    .bind(error_code)
+    .bind(error_message)
+    .bind(attempt_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Finish an in-flight Delivery Attempt (the row with `finished_at IS NULL`).
+async fn finish_delivery_attempt(
+    conn: &mut SqliteConnection,
+    attempt_id: &str,
+    finished_at: OffsetDateTime,
+    status: &str,
+    retryable: bool,
+    http_status: Option<i64>,
+    error_message: Option<&str>,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "UPDATE delivery_attempts
+         SET finished_at = ?, status = ?, retryable = ?, http_status = ?, error_message = ?
+         WHERE id = ?",
+    )
+    .bind(timestamp::format(finished_at))
+    .bind(status)
+    .bind(retryable)
+    .bind(http_status)
+    .bind(error_message)
+    .bind(attempt_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Insert a Transcript row within a transaction.
+async fn insert_transcript(
+    conn: &mut SqliteConnection,
+    transcript: &NewTranscript,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO transcripts (
+             recording_id, provider, text, raw_json,
+             provider_file_id, provider_transcription_id, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&transcript.recording_id)
+    .bind(&transcript.provider)
+    .bind(&transcript.text)
+    .bind(&transcript.raw_json)
+    .bind(transcript.provider_file_id.as_deref())
+    .bind(transcript.provider_transcription_id.as_deref())
+    .bind(timestamp::format(transcript.created_at))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Look up the Recording a Delivery belongs to within a transaction.
+async fn recording_id_for_delivery(
+    conn: &mut SqliteConnection,
+    delivery_id: &str,
+) -> Result<String, StorageError> {
+    let recording_id: Option<String> =
+        sqlx::query_scalar("SELECT recording_id FROM deliveries WHERE id = ?")
+            .bind(delivery_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    recording_id.ok_or_else(|| StorageError::DeliveryNotFound(delivery_id.to_string()))
 }
 
 // ---------------------------------------------------------------------------

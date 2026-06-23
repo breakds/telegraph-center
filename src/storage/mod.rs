@@ -9,7 +9,7 @@ pub mod sqlite;
 
 use time::OffsetDateTime;
 
-use crate::domain::{InvalidTransition, Tags};
+use crate::domain::{Delivery, InvalidTransition, Recording, Tags, Transcript};
 
 pub use sqlite::SqliteStore;
 
@@ -186,6 +186,46 @@ pub struct NewLoginFailure {
     pub remote_ip: String,
     /// When the failure occurred.
     pub failed_at: OffsetDateTime,
+}
+
+/// A `transcribing` Recording eligible for a retry attempt: it has at least one
+/// finished Transcription Attempt and no in-flight one.
+#[derive(Debug, Clone)]
+pub struct TranscriptionRetryCandidate {
+    /// The Recording awaiting another Transcription attempt.
+    pub recording: Recording,
+    /// Number of the latest (finished) Transcription Attempt.
+    pub last_attempt_number: i64,
+    /// When the latest Transcription Attempt finished. Backoff is measured from
+    /// the failure, not from when the attempt started.
+    pub last_attempt_finished_at: OffsetDateTime,
+}
+
+/// The result of claiming an in-flight Transcription Attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptionAttemptStart {
+    /// 1-based number assigned to the new attempt.
+    pub attempt_number: i64,
+    /// When the first Transcription Attempt for this Recording started, used to
+    /// anchor the retry deadline window.
+    pub first_started_at: OffsetDateTime,
+}
+
+/// A `delivering` Delivery eligible for a Delivery attempt: it has no in-flight
+/// attempt. `last_attempt_*` is `None` before the first attempt.
+#[derive(Debug, Clone)]
+pub struct DeliveryCandidate {
+    /// The Delivery to attempt.
+    pub delivery: Delivery,
+    /// The Recording being delivered.
+    pub recording: Recording,
+    /// The Transcript payload to deliver.
+    pub transcript: Transcript,
+    /// Number of the latest finished Delivery Attempt, if any.
+    pub last_attempt_number: Option<i64>,
+    /// When the latest finished Delivery Attempt finished, if any. Backoff is
+    /// measured from the failure, not from when the attempt started.
+    pub last_attempt_finished_at: Option<OffsetDateTime>,
 }
 
 /// Input for appending an audit event.
