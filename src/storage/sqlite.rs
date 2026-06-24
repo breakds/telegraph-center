@@ -542,6 +542,26 @@ impl SqliteStore {
         row.map(OperatorSessionRow::into_domain).transpose()
     }
 
+    /// Refresh an active session's `last_seen_at` and `idle_expires_at`,
+    /// returning whether a row was updated. A revoked session is left untouched.
+    pub async fn touch_session(
+        &self,
+        session_hash: &str,
+        last_seen_at: OffsetDateTime,
+        idle_expires_at: OffsetDateTime,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE operator_sessions SET last_seen_at = ?, idle_expires_at = ?
+             WHERE session_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(timestamp::format(last_seen_at))
+        .bind(timestamp::format(idle_expires_at))
+        .bind(session_hash)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Revoke an Operator Session, returning whether a row was updated.
     pub async fn revoke_session(
         &self,
@@ -572,6 +592,21 @@ impl SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Clear login failures for a username/IP pair after a successful login,
+    /// returning how many rows were removed.
+    pub async fn clear_login_failures(
+        &self,
+        username: &str,
+        remote_ip: &str,
+    ) -> Result<u64, StorageError> {
+        let result = sqlx::query("DELETE FROM login_failures WHERE username = ? OR remote_ip = ?")
+            .bind(username)
+            .bind(remote_ip)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Count recent login failures matching a username or remote IP since a

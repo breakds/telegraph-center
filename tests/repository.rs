@@ -445,6 +445,79 @@ async fn operator_session_can_be_created_fetched_and_revoked() {
 }
 
 #[tokio::test]
+async fn touch_session_refreshes_idle_window_but_not_revoked_sessions() {
+    let (_dir, store) = fresh_store().await;
+    store
+        .create_session(NewOperatorSession {
+            session_hash: "sess-hash".to_string(),
+            operator_username: "break".to_string(),
+            csrf_token_hash: "csrf-hash".to_string(),
+            created_at: at(0),
+            last_seen_at: at(0),
+            idle_expires_at: at(7 * 86_400),
+            absolute_expires_at: at(14 * 86_400),
+        })
+        .await
+        .unwrap();
+
+    let touched = store
+        .touch_session("sess-hash", at(3_600), at(3_600 + 7 * 86_400))
+        .await
+        .unwrap();
+    assert!(touched);
+
+    let refreshed = store.get_session("sess-hash").await.unwrap().unwrap();
+    assert_eq!(refreshed.last_seen_at, at(3_600));
+    assert_eq!(refreshed.idle_expires_at, at(3_600 + 7 * 86_400));
+
+    // A revoked session cannot be touched back to life.
+    assert!(store.revoke_session("sess-hash", at(7_200)).await.unwrap());
+    let touched_revoked = store
+        .touch_session("sess-hash", at(10_000), at(10_000 + 7 * 86_400))
+        .await
+        .unwrap();
+    assert!(!touched_revoked);
+}
+
+#[tokio::test]
+async fn clear_login_failures_removes_matching_rows() {
+    let (_dir, store) = fresh_store().await;
+    for (i, (username, ip)) in [
+        ("break", "10.0.0.1"),
+        ("break", "10.0.0.2"),
+        ("someone", "10.0.0.1"),
+        ("someone", "192.168.1.1"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .record_login_failure(NewLoginFailure {
+                id: format!("lf-{i}"),
+                username: username.to_string(),
+                remote_ip: ip.to_string(),
+                failed_at: at(0),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Clears rows matching the username OR the IP (the first three rows).
+    let removed = store
+        .clear_login_failures("break", "10.0.0.1")
+        .await
+        .unwrap();
+    assert_eq!(removed, 3);
+
+    // The unrelated username/IP row survives.
+    let remaining = store
+        .count_login_failures_since("someone", "192.168.1.1", at(0))
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1);
+}
+
+#[tokio::test]
 async fn login_failures_are_counted_within_window() {
     let (_dir, store) = fresh_store().await;
     for (i, seconds) in [0, 30, 60].into_iter().enumerate() {

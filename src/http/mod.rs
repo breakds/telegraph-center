@@ -44,3 +44,11 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::disable())
         .with_state(state)
 }
+
+/// Build the full application: the Client API under `/api/*` and the Operator
+/// monitor under `/monitor/*` on one Axum app, sharing the same SQLite store but
+/// distinct state. The API never requires an Operator Session, and the monitor
+/// cookie is scoped to `/monitor`, so the two surfaces stay independent.
+pub fn app(api: AppState, monitor: crate::monitor::MonitorState) -> Router {
+    router(api).merge(crate::monitor::router(monitor))
+}

@@ -11,6 +11,7 @@ pub mod config;
 pub mod delivery;
 pub mod domain;
 pub mod http;
+pub mod monitor;
 pub mod routing;
 pub mod seam;
 pub mod soniox;

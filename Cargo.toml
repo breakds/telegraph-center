@@ -29,6 +29,16 @@ ulid = "1"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 hmac = "0.12"
 sha2 = "0.10"
+# Operator auth (M6): Argon2id PHC password verification, OS CSPRNG tokens, and
+# server-rendered login/monitor templates. argon2 needs only PHC verification, so
+# the salt-generating `rand` default feature is left off. Session/CSRF tokens are
+# high-entropy random values, hashed with the existing `sha2`, not argon2.
+argon2 = { version = "0.5", default-features = false, features = [
+  "alloc",
+  "password-hash",
+] }
+getrandom = "0.2"
+askama = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
