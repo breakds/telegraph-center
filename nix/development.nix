@@ -33,6 +33,11 @@ in
       commonArgs = {
         inherit src;
         strictDeps = true;
+        # reqwest uses native-tls, so openssl-sys needs pkg-config (a build-time
+        # tool) to locate the openssl libraries at compile time.
+        nativeBuildInputs = with pkgs-dev; [
+          pkg-config
+        ];
         buildInputs =
           with pkgs-dev;
           [

@@ -74,6 +74,7 @@ pub struct TranscriptionRequest<'a> {
 }
 
 /// The result of a successful Transcription.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptionOutput {
     /// Speech-to-text provider name (stored on the Transcript).
     pub provider: String,

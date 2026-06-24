@@ -11,6 +11,7 @@ pub mod config;
 pub mod domain;
 pub mod http;
 pub mod seam;
+pub mod soniox;
 pub mod storage;
 pub mod wav;
 pub mod workers;
