@@ -8,8 +8,10 @@
 
 pub mod blob;
 pub mod config;
+pub mod delivery;
 pub mod domain;
 pub mod http;
+pub mod routing;
 pub mod seam;
 pub mod soniox;
 pub mod storage;

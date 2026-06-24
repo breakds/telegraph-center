@@ -31,9 +31,45 @@ pub enum StorageError {
     /// A Delivery referenced by id does not exist.
     #[error("delivery not found: {0:?}")]
     DeliveryNotFound(String),
+    /// Manual Routing was attempted on a Recording that is not Backlogged.
+    #[error("recording {id:?} is not backlogged (status {status})")]
+    RecordingNotBacklogged {
+        /// The Recording id.
+        id: String,
+        /// The Recording's current status.
+        status: String,
+    },
     /// Data read back from storage could not be interpreted.
     #[error("corrupt stored data: {0}")]
     Corrupt(String),
+}
+
+/// The outcome of an automatic routing attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoutingOutcome {
+    /// A Sink was selected and the Delivery created.
+    Selected(Delivery),
+    /// Another worker already moved the Recording out of `routing`; nothing to do.
+    AlreadyHandled,
+}
+
+/// Input for an Operator Manual Routing action on a Backlogged Recording.
+#[derive(Debug, Clone)]
+pub struct ManualRoute {
+    /// The Backlogged Recording to route.
+    pub recording_id: String,
+    /// The configured Sink name selected by the Operator.
+    pub sink_name: String,
+    /// Stable Delivery identifier.
+    pub delivery_id: String,
+    /// Stable id for the appended audit event.
+    pub audit_event_id: String,
+    /// When the Sink was selected.
+    pub selected_at: OffsetDateTime,
+    /// Deadline after which Delivery retries stop.
+    pub retry_deadline_at: OffsetDateTime,
+    /// Operator identifier for the audit event, if known.
+    pub actor_id: Option<String>,
 }
 
 /// The outcome of a create-or-get Recording call.

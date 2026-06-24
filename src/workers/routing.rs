@@ -36,10 +36,9 @@ pub async fn tick_once<R: Router>(
                 selected_at: now,
                 retry_deadline_at: Some(now + retry::DELIVERY_WINDOW),
             };
-            match ctx.store.select_sink(delivery).await {
-                Ok(_) | Err(StorageError::InvalidTransition(_)) => {}
-                Err(err) => return Err(err),
-            }
+            // `route_to_sink` is race-safe: a concurrent worker that already
+            // handled this Recording yields `AlreadyHandled` rather than an error.
+            ctx.store.route_to_sink(delivery).await?;
         }
     }
 

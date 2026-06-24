@@ -17,9 +17,10 @@ use crate::domain::{
 };
 
 use super::{
-    DeliveryCandidate, NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure,
-    NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt, RecordingCreation,
-    StorageError, TranscriptionAttemptStart, TranscriptionRetryCandidate,
+    DeliveryCandidate, ManualRoute, NewAuditEvent, NewDelivery, NewDeliveryAttempt,
+    NewLoginFailure, NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt,
+    RecordingCreation, RoutingOutcome, StorageError, TranscriptionAttemptStart,
+    TranscriptionRetryCandidate,
 };
 
 /// A SQLite-backed store. Cloning shares the underlying connection pool.
@@ -245,31 +246,8 @@ impl SqliteStore {
     /// Select a Sink: create the one-per-Recording Delivery, record the
     /// selected Sink name, and move the Recording to `delivering`.
     pub async fn select_sink(&self, new: NewDelivery) -> Result<Delivery, StorageError> {
-        let selected = timestamp::format(new.selected_at);
-        let deadline = new.retry_deadline_at.map(timestamp::format);
         let mut tx = self.pool.begin().await?;
-
-        sqlx::query(
-            "INSERT INTO deliveries (
-                 id, recording_id, sink_name, status,
-                 selected_at, completed_at, retry_deadline_at, latest_error
-             ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)",
-        )
-        .bind(&new.id)
-        .bind(&new.recording_id)
-        .bind(&new.sink_name)
-        .bind(DeliveryStatus::Delivering.as_str())
-        .bind(&selected)
-        .bind(deadline.as_deref())
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("UPDATE recordings SET selected_sink_name = ? WHERE id = ?")
-            .bind(&new.sink_name)
-            .bind(&new.recording_id)
-            .execute(&mut *tx)
-            .await?;
-
+        insert_delivery(&mut tx, &new).await?;
         guarded_transition(
             &mut tx,
             &new.recording_id,
@@ -280,6 +258,92 @@ impl SqliteStore {
         tx.commit().await?;
 
         self.require_delivery(&new.id).await
+    }
+
+    /// Atomically route a `routing` Recording to a Sink: create the one
+    /// Delivery, record the Sink, and transition to `delivering`.
+    ///
+    /// Race-safe against duplicate Routing workers: the claim is a single
+    /// conditional `UPDATE ... WHERE status = 'routing'`, which SQLite serializes
+    /// with other writers, so exactly one worker wins. The losers see zero rows
+    /// updated and return [`RoutingOutcome::AlreadyHandled`] before inserting any
+    /// Delivery, so there is no UNIQUE violation or noisy expected error.
+    pub async fn route_to_sink(&self, new: NewDelivery) -> Result<RoutingOutcome, StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        let claimed = sqlx::query(
+            "UPDATE recordings SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+        )
+        .bind(RecordingStatus::Delivering.as_str())
+        .bind(timestamp::format(new.selected_at))
+        .bind(&new.recording_id)
+        .bind(RecordingStatus::Routing.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        if claimed.rows_affected() == 0 {
+            // Either already handled by another worker or no longer `routing`.
+            return Ok(RoutingOutcome::AlreadyHandled);
+        }
+
+        insert_delivery(&mut tx, &new).await?;
+        tx.commit().await?;
+
+        Ok(RoutingOutcome::Selected(
+            self.require_delivery(&new.id).await?,
+        ))
+    }
+
+    /// Manually route a Backlogged Recording to a configured Sink.
+    ///
+    /// Allowed only from `backlogged`. Creates the one Delivery, records the
+    /// Sink, transitions `backlogged -> delivering`, and appends a
+    /// `manual_routing` audit event. The Sink name is taken as-is; the caller is
+    /// responsible for validating it against configured Sinks.
+    pub async fn manual_route(&self, input: ManualRoute) -> Result<Delivery, StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        let status = current_status(&mut tx, &input.recording_id).await?;
+        if status != RecordingStatus::Backlogged {
+            return Err(StorageError::RecordingNotBacklogged {
+                id: input.recording_id,
+                status: status.to_string(),
+            });
+        }
+
+        let delivery = NewDelivery {
+            id: input.delivery_id.clone(),
+            recording_id: input.recording_id.clone(),
+            sink_name: input.sink_name.clone(),
+            selected_at: input.selected_at,
+            retry_deadline_at: Some(input.retry_deadline_at),
+        };
+        insert_delivery(&mut tx, &delivery).await?;
+        guarded_transition(
+            &mut tx,
+            &input.recording_id,
+            RecordingStatus::Delivering,
+            input.selected_at,
+        )
+        .await?;
+
+        let details = serde_json::json!({ "sink": input.sink_name }).to_string();
+        insert_audit_event_tx(
+            &mut tx,
+            &NewAuditEvent {
+                id: input.audit_event_id,
+                occurred_at: input.selected_at,
+                actor_kind: "operator".to_string(),
+                actor_id: input.actor_id,
+                event_type: "manual_routing".to_string(),
+                recording_id: Some(input.recording_id.clone()),
+                details_json: details,
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.require_delivery(&input.delivery_id).await
     }
 
     /// Fetch a Delivery by its identifier.
@@ -534,20 +598,8 @@ impl SqliteStore {
 
     /// Append an audit event.
     pub async fn insert_audit_event(&self, new: NewAuditEvent) -> Result<AuditEvent, StorageError> {
-        sqlx::query(
-            "INSERT INTO audit_events (
-                 id, occurred_at, actor_kind, actor_id, event_type, recording_id, details_json
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&new.id)
-        .bind(timestamp::format(new.occurred_at))
-        .bind(&new.actor_kind)
-        .bind(new.actor_id.as_deref())
-        .bind(&new.event_type)
-        .bind(new.recording_id.as_deref())
-        .bind(&new.details_json)
-        .execute(&self.pool)
-        .await?;
+        let mut conn = self.pool.acquire().await?;
+        insert_audit_event_tx(&mut conn, &new).await?;
 
         Ok(AuditEvent {
             id: new.id,
@@ -1144,6 +1196,69 @@ async fn recording_id_for_delivery(
             .fetch_optional(&mut *conn)
             .await?;
     recording_id.ok_or_else(|| StorageError::DeliveryNotFound(delivery_id.to_string()))
+}
+
+/// Read a Recording's current status within a transaction.
+async fn current_status(
+    conn: &mut SqliteConnection,
+    recording_id: &str,
+) -> Result<RecordingStatus, StorageError> {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM recordings WHERE id = ?")
+        .bind(recording_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let status = status.ok_or_else(|| StorageError::RecordingNotFound(recording_id.to_string()))?;
+    RecordingStatus::parse(&status).map_err(|e| StorageError::Corrupt(e.to_string()))
+}
+
+/// Insert the one-per-Recording Delivery row and record the selected Sink name.
+async fn insert_delivery(
+    conn: &mut SqliteConnection,
+    new: &NewDelivery,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO deliveries (
+             id, recording_id, sink_name, status,
+             selected_at, completed_at, retry_deadline_at, latest_error
+         ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)",
+    )
+    .bind(&new.id)
+    .bind(&new.recording_id)
+    .bind(&new.sink_name)
+    .bind(DeliveryStatus::Delivering.as_str())
+    .bind(timestamp::format(new.selected_at))
+    .bind(new.retry_deadline_at.map(timestamp::format))
+    .execute(&mut *conn)
+    .await?;
+
+    sqlx::query("UPDATE recordings SET selected_sink_name = ? WHERE id = ?")
+        .bind(&new.sink_name)
+        .bind(&new.recording_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Insert an audit event within a transaction.
+async fn insert_audit_event_tx(
+    conn: &mut SqliteConnection,
+    new: &NewAuditEvent,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO audit_events (
+             id, occurred_at, actor_kind, actor_id, event_type, recording_id, details_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&new.id)
+    .bind(timestamp::format(new.occurred_at))
+    .bind(&new.actor_kind)
+    .bind(new.actor_id.as_deref())
+    .bind(&new.event_type)
+    .bind(new.recording_id.as_deref())
+    .bind(&new.details_json)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

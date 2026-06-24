@@ -10,8 +10,9 @@ use time::macros::datetime;
 
 use telegraph_center::domain::{DeliveryStatus, RecordingStatus, Tags};
 use telegraph_center::storage::{
-    NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure, NewOperatorSession,
-    NewRecording, NewTranscript, NewTranscriptionAttempt, SqliteStore, StorageError,
+    ManualRoute, NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure,
+    NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt, RoutingOutcome,
+    SqliteStore, StorageError,
 };
 
 const T0: OffsetDateTime = datetime!(2026-06-23 12:00:00 UTC);
@@ -507,4 +508,197 @@ async fn audit_events_are_appended_and_queryable() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].event_type, "manual_routing");
     assert_eq!(events[0].details_json, r#"{"sink":"journal"}"#);
+}
+
+/// Drive a Recording to `routing` (transcribed, awaiting a Sink decision).
+async fn route_setup(store: &SqliteStore, recording_id: &str) {
+    store
+        .create_recording(new_recording(recording_id, "litewatch-main", recording_id))
+        .await
+        .unwrap();
+    store
+        .update_recording_status(recording_id, RecordingStatus::Transcribing, at(1))
+        .await
+        .unwrap();
+    store
+        .store_transcript(NewTranscript {
+            recording_id: recording_id.to_string(),
+            provider: "soniox".to_string(),
+            text: "hello world".to_string(),
+            raw_json: "{}".to_string(),
+            provider_file_id: None,
+            provider_transcription_id: None,
+            created_at: at(2),
+        })
+        .await
+        .unwrap();
+}
+
+fn delivery_for(recording_id: &str, delivery_id: &str, at_secs: i64) -> NewDelivery {
+    NewDelivery {
+        id: delivery_id.to_string(),
+        recording_id: recording_id.to_string(),
+        sink_name: "journal".to_string(),
+        selected_at: at(at_secs),
+        retry_deadline_at: Some(at(at_secs + 86_400)),
+    }
+}
+
+#[tokio::test]
+async fn route_to_sink_selects_and_is_idempotent() {
+    let (_dir, store) = fresh_store().await;
+    route_setup(&store, "rec-1").await;
+
+    let outcome = store
+        .route_to_sink(delivery_for("rec-1", "del-1", 3))
+        .await
+        .unwrap();
+    let RoutingOutcome::Selected(delivery) = outcome else {
+        panic!("expected a Sink to be selected");
+    };
+    assert_eq!(delivery.id, "del-1");
+    assert_eq!(delivery.sink_name, "journal");
+    assert_eq!(
+        store.get_recording("rec-1").await.unwrap().unwrap().status,
+        RecordingStatus::Delivering
+    );
+
+    // A second routing attempt (the Recording is no longer `routing`) is a
+    // benign no-op and must not create a second Delivery.
+    let again = store
+        .route_to_sink(delivery_for("rec-1", "del-2", 4))
+        .await
+        .unwrap();
+    assert_eq!(again, RoutingOutcome::AlreadyHandled);
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deliveries WHERE recording_id = ?")
+        .bind("rec-1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn manual_route_from_backlog_creates_delivery_and_audit() {
+    let (_dir, store) = fresh_store().await;
+    route_setup(&store, "rec-1").await;
+    store.mark_backlogged("rec-1", at(3)).await.unwrap();
+
+    let delivery = store
+        .manual_route(ManualRoute {
+            recording_id: "rec-1".to_string(),
+            sink_name: "journal".to_string(),
+            delivery_id: "del-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            selected_at: at(100),
+            retry_deadline_at: at(100 + 86_400),
+            actor_id: Some("break".to_string()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(delivery.id, "del-1");
+    assert_eq!(delivery.sink_name, "journal");
+    assert_eq!(delivery.status, DeliveryStatus::Delivering);
+    assert_eq!(delivery.retry_deadline_at, Some(at(100 + 86_400)));
+
+    let recording = store.get_recording("rec-1").await.unwrap().unwrap();
+    assert_eq!(recording.status, RecordingStatus::Delivering);
+    assert_eq!(recording.selected_sink_name.as_deref(), Some("journal"));
+
+    let events = store
+        .list_audit_events_for_recording("rec-1")
+        .await
+        .unwrap();
+    let manual = events
+        .iter()
+        .find(|event| event.event_type == "manual_routing")
+        .expect("manual_routing audit event");
+    assert_eq!(manual.details_json, r#"{"sink":"journal"}"#);
+    assert_eq!(manual.actor_id.as_deref(), Some("break"));
+}
+
+#[tokio::test]
+async fn manual_route_rejects_non_backlogged_recording() {
+    let (_dir, store) = fresh_store().await;
+    route_setup(&store, "rec-1").await; // status is `routing`, not `backlogged`
+
+    let err = store
+        .manual_route(ManualRoute {
+            recording_id: "rec-1".to_string(),
+            sink_name: "journal".to_string(),
+            delivery_id: "del-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            selected_at: at(100),
+            retry_deadline_at: at(100 + 86_400),
+            actor_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::RecordingNotBacklogged { .. }));
+
+    // No Delivery and no audit event were created.
+    assert!(
+        store
+            .get_delivery_for_recording("rec-1")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn manual_route_rejects_unknown_recording() {
+    let (_dir, store) = fresh_store().await;
+    let err = store
+        .manual_route(ManualRoute {
+            recording_id: "missing".to_string(),
+            sink_name: "journal".to_string(),
+            delivery_id: "del-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            selected_at: at(100),
+            retry_deadline_at: at(100 + 86_400),
+            actor_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::RecordingNotFound(_)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_route_to_sink_selects_exactly_once() {
+    let (_dir, store) = fresh_store().await;
+    route_setup(&store, "rec-1").await;
+
+    // Two workers race to route the same `routing` Recording.
+    let s1 = store.clone();
+    let s2 = store.clone();
+    let (a, b) = tokio::join!(
+        s1.route_to_sink(delivery_for("rec-1", "del-a", 3)),
+        s2.route_to_sink(delivery_for("rec-1", "del-b", 3)),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+
+    let selected = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, RoutingOutcome::Selected(_)))
+        .count();
+    let already = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, RoutingOutcome::AlreadyHandled))
+        .count();
+    assert_eq!(selected, 1, "exactly one worker should win");
+    assert_eq!(
+        already, 1,
+        "the other should see AlreadyHandled, not an error"
+    );
+
+    // Exactly one Delivery exists for the Recording.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deliveries WHERE recording_id = ?")
+        .bind("rec-1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
 }
