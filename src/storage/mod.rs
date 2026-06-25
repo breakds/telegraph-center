@@ -348,6 +348,28 @@ pub struct TranscriptionRetryCandidate {
     pub retry_window_started_at: Option<OffsetDateTime>,
 }
 
+/// Counts of work reclaimed by [`SqliteStore::recover_abandoned_attempts`] at
+/// startup, for logging and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoveryReport {
+    /// In-flight Transcription Attempts closed as retryable.
+    pub transcription_attempts: u64,
+    /// Recordings reverted from `transcribing` to `received` because they were
+    /// claimed but no attempt was recorded before the process stopped.
+    pub reverted_recordings: u64,
+    /// In-flight Delivery Attempts closed as retryable.
+    pub delivery_attempts: u64,
+}
+
+impl RecoveryReport {
+    /// Whether any abandoned work was reclaimed.
+    pub fn has_changes(&self) -> bool {
+        self.transcription_attempts > 0
+            || self.reverted_recordings > 0
+            || self.delivery_attempts > 0
+    }
+}
+
 /// The result of claiming an in-flight Transcription Attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptionAttemptStart {

@@ -21,6 +21,8 @@ tokio = { version = "1", features = [
   "io-util",
   "time",
   "sync",
+  "net",
+  "signal",
 ] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 thiserror = "2"

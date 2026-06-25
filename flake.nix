@@ -30,5 +30,10 @@
       perSystem = { pkgs-dev, ... }: {
         formatter = pkgs-dev.nixfmt;
       };
+
+      flake = {
+        nixosModules.telegraph-center = ./nix/nixos-module.nix;
+        nixosModules.default = ./nix/nixos-module.nix;
+      };
     };
 }

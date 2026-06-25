@@ -20,9 +20,12 @@ use super::{
     DeliveryCandidate, ManualRetryDelivery, ManualRetryTranscription, ManualRoute,
     MonitorStatusFilter, NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure,
     NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt, RecordingCreation,
-    RecordingDetail, RecordingSummary, RoutingOutcome, StorageError, TranscriptionAttemptStart,
-    TranscriptionRetryCandidate,
+    RecordingDetail, RecordingSummary, RecoveryReport, RoutingOutcome, StorageError,
+    TranscriptionAttemptStart, TranscriptionRetryCandidate,
 };
+
+/// Error surfaced on attempts and Recordings reclaimed at startup.
+const ABANDONED_MESSAGE: &str = "attempt abandoned when the service stopped";
 
 /// A SQLite-backed store. Cloning shares the underlying connection pool.
 #[derive(Debug, Clone)]
@@ -54,6 +57,89 @@ impl SqliteStore {
     /// The underlying connection pool, for advanced use.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Reclaim work abandoned by a previous process so an abrupt stop (SIGKILL,
+    /// crash, power loss, or a `SIGTERM` past the stop timeout) cannot strand it.
+    ///
+    /// This must run at startup before any worker, while the process is the sole
+    /// writer, so every `finished_at IS NULL` attempt is genuinely abandoned
+    /// rather than in flight elsewhere. Abandoned attempts are closed as
+    /// retryable failures, which puts the Recording/Delivery back on the normal
+    /// retry path; a Recording claimed for Transcription but with no attempt yet
+    /// recorded is reverted to `received` so the claim path picks it up again.
+    pub async fn recover_abandoned_attempts(
+        &self,
+        now: OffsetDateTime,
+    ) -> Result<RecoveryReport, StorageError> {
+        let ts = timestamp::format(now);
+        let mut tx = self.pool.begin().await?;
+
+        // Surface the error on affected Recordings before closing the attempts,
+        // while the in-flight rows can still be selected.
+        sqlx::query(
+            "UPDATE recordings SET latest_error = ?, updated_at = ?
+             WHERE id IN (SELECT recording_id FROM transcription_attempts
+                            WHERE finished_at IS NULL)",
+        )
+        .bind(ABANDONED_MESSAGE)
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?;
+        let transcription_attempts = sqlx::query(
+            "UPDATE transcription_attempts
+             SET finished_at = ?, status = 'failed', retryable = 1,
+                 error_code = 'abandoned', error_message = ?
+             WHERE finished_at IS NULL",
+        )
+        .bind(&ts)
+        .bind(ABANDONED_MESSAGE)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        // Recordings claimed for Transcription before any attempt was recorded
+        // (the gap between claiming and inserting the attempt) revert to
+        // `received`. Run after closing in-flight attempts so those, now having a
+        // finished attempt, are excluded.
+        let reverted_recordings = sqlx::query(
+            "UPDATE recordings SET status = 'received', updated_at = ?
+             WHERE status = 'transcribing'
+               AND NOT EXISTS (SELECT 1 FROM transcription_attempts a
+                                 WHERE a.recording_id = recordings.id)",
+        )
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        sqlx::query(
+            "UPDATE recordings SET latest_error = ?, updated_at = ?
+             WHERE id IN (SELECT d.recording_id FROM deliveries d
+                            JOIN delivery_attempts a ON a.delivery_id = d.id
+                            WHERE a.finished_at IS NULL)",
+        )
+        .bind(ABANDONED_MESSAGE)
+        .bind(&ts)
+        .execute(&mut *tx)
+        .await?;
+        let delivery_attempts = sqlx::query(
+            "UPDATE delivery_attempts
+             SET finished_at = ?, status = 'failed', retryable = 1, error_message = ?
+             WHERE finished_at IS NULL",
+        )
+        .bind(&ts)
+        .bind(ABANDONED_MESSAGE)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        tx.commit().await?;
+        Ok(RecoveryReport {
+            transcription_attempts,
+            reverted_recordings,
+            delivery_attempts,
+        })
     }
 
     // -- Recordings ---------------------------------------------------------

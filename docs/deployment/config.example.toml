@@ -1,0 +1,40 @@
+# Example Telegraph Center config. Safe to commit and review: it only NAMES the
+# environment variables that hold secrets, never the secret values themselves.
+# The Soniox API key, the Operator password hash, and Webhook Sink secrets are
+# supplied through the systemd EnvironmentFile (see telegraph.env.example).
+
+[server]
+# The app listens on loopback only; nginx terminates TLS and proxies to it.
+listen = "127.0.0.1:7088"
+public_base_path = ""
+
+[data]
+# Persistent directory for the SQLite database and audio blobs. Must match the
+# NixOS module's `dataDir`.
+dir = "/var/lib/telegraph-center"
+max_upload_bytes = 268435456
+
+# One entry per Client. `certificate_fingerprint` must equal the value nginx
+# puts in the X-Telegraph-Client-Fingerprint header for that Client's mTLS cert.
+# See README.md for how to compute it.
+[[clients]]
+name = "litewatch-main"
+certificate_fingerprint = "sha1:REPLACE_WITH_NGINX_CLIENT_FINGERPRINT"
+
+[operator]
+username = "break"
+password_hash_env = "TELEGRAPH_OPERATOR_PASSWORD_HASH"
+
+[soniox]
+api_key_env = "SONIOX_API_KEY"
+model = "stt-async-v5"
+language_hints = ["en"]
+enable_speaker_diarization = true
+enable_language_identification = false
+
+[[sinks]]
+name = "journal"
+type = "webhook"
+url = "http://127.0.0.1:8644/webhooks/journal"
+secret_env = "HERMES_JOURNAL_WEBHOOK_SECRET"
+match_tags = ["journal", "diary"]

@@ -1064,3 +1064,111 @@ async fn manual_retry_delivery_only_from_failed_and_preserves_sink() {
             .any(|e| e.event_type == "manual_retry_delivery")
     );
 }
+
+#[tokio::test]
+async fn recovery_closes_an_abandoned_transcription_attempt() {
+    let (_dir, store) = fresh_store().await;
+    store
+        .create_recording(new_recording("rec-1", "litewatch-main", "cr-1"))
+        .await
+        .unwrap();
+    store.claim_received_for_transcription(at(1)).await.unwrap();
+    store
+        .start_transcription_attempt("att-1", "rec-1", at(1))
+        .await
+        .unwrap()
+        .expect("claim the attempt");
+
+    // While the attempt is in flight the Recording is neither re-claimable nor a
+    // retry candidate: it would be stranded if the process stopped now.
+    assert!(
+        store
+            .transcription_retry_candidates()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let report = store.recover_abandoned_attempts(at(10)).await.unwrap();
+    assert_eq!(report.transcription_attempts, 1);
+    assert_eq!(report.reverted_recordings, 0);
+    assert_eq!(report.delivery_attempts, 0);
+    assert!(report.has_changes());
+
+    // The attempt is now finished, so the normal retry path picks the Recording
+    // up with backoff measured from the recovery time.
+    let candidates = store.transcription_retry_candidates().await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].recording.id, "rec-1");
+    assert_eq!(candidates[0].last_attempt_number, 1);
+    assert_eq!(candidates[0].last_attempt_finished_at, at(10));
+
+    let recording = store.get_recording("rec-1").await.unwrap().unwrap();
+    assert_eq!(recording.status, RecordingStatus::Transcribing);
+    assert!(recording.latest_error.is_some());
+}
+
+#[tokio::test]
+async fn recovery_reverts_a_recording_claimed_without_an_attempt() {
+    let (_dir, store) = fresh_store().await;
+    store
+        .create_recording(new_recording("rec-1", "litewatch-main", "cr-1"))
+        .await
+        .unwrap();
+    // Claimed for Transcription, but the process stopped before the attempt row
+    // was inserted.
+    store.claim_received_for_transcription(at(1)).await.unwrap();
+
+    let report = store.recover_abandoned_attempts(at(10)).await.unwrap();
+    assert_eq!(report.reverted_recordings, 1);
+    assert_eq!(report.transcription_attempts, 0);
+
+    // Back to `received`, so the claim path picks it up again.
+    let reclaimed = store
+        .claim_received_for_transcription(at(11))
+        .await
+        .unwrap()
+        .expect("recording is claimable again");
+    assert_eq!(reclaimed.id, "rec-1");
+}
+
+#[tokio::test]
+async fn recovery_closes_an_abandoned_delivery_attempt() {
+    let (_dir, store) = fresh_store().await;
+    let delivery_id = deliver_setup(&store, "rec-1").await;
+    store
+        .start_delivery_attempt("att-1", &delivery_id, at(4))
+        .await
+        .unwrap()
+        .expect("claim the delivery attempt");
+
+    // In flight: excluded from the delivery work queue until recovered.
+    assert!(store.delivery_candidates().await.unwrap().is_empty());
+
+    let report = store.recover_abandoned_attempts(at(20)).await.unwrap();
+    assert_eq!(report.delivery_attempts, 1);
+    assert_eq!(report.transcription_attempts, 0);
+
+    let candidates = store.delivery_candidates().await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].delivery.id, delivery_id);
+    assert_eq!(candidates[0].last_attempt_finished_at, Some(at(20)));
+}
+
+#[tokio::test]
+async fn recovery_is_a_noop_without_abandoned_work() {
+    let (_dir, store) = fresh_store().await;
+    store
+        .create_recording(new_recording("rec-1", "litewatch-main", "cr-1"))
+        .await
+        .unwrap();
+
+    let report = store.recover_abandoned_attempts(at(10)).await.unwrap();
+    assert!(!report.has_changes());
+    assert_eq!(report.transcription_attempts, 0);
+    assert_eq!(report.reverted_recordings, 0);
+    assert_eq!(report.delivery_attempts, 0);
+
+    let recording = store.get_recording("rec-1").await.unwrap().unwrap();
+    assert_eq!(recording.status, RecordingStatus::Received);
+}

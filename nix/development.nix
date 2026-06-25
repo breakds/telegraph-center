@@ -52,6 +52,35 @@ in
       };
 
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+      telegraph-center = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
+
+      # Evaluate the NixOS module in a minimal system so `nix flake check`
+      # exercises it: assert the generated unit runs the package, reads the
+      # config path, and loads the secret environment file.
+      nixosEval = nixpkgs.lib.nixosSystem {
+        inherit system;
+        modules = [
+          ./nixos-module.nix
+          (
+            { ... }:
+            {
+              boot.loader.grub.devices = [ "nodev" ];
+              fileSystems."/" = {
+                device = "none";
+                fsType = "tmpfs";
+              };
+              system.stateVersion = "24.05";
+              services.telegraph-center = {
+                enable = true;
+                package = telegraph-center;
+                configFile = "/etc/telegraph-center/config.toml";
+                environmentFile = "/run/secrets/telegraph.env";
+              };
+            }
+          )
+        ];
+      };
     in
     {
       _module.args.pkgs-dev = import nixpkgs {
@@ -59,8 +88,23 @@ in
         config.allowUnfree = true;
       };
 
+      packages = lib.optionalAttrs hasCargoToml {
+        inherit telegraph-center;
+        default = telegraph-center;
+      };
+
       checks = lib.optionalAttrs hasCargoToml {
         clippy = craneLib.cargoClippy (commonArgs // { inherit cargoArtifacts; });
+
+        nixos-module = pkgs-dev.runCommand "telegraph-center-nixos-eval" {
+          unit = nixosEval.config.systemd.units."telegraph-center.service".text;
+        } ''
+          echo "$unit" > unit.txt
+          grep -q "/bin/telegraph-center" unit.txt
+          grep -q "EnvironmentFile=/run/secrets/telegraph.env" unit.txt
+          grep -q "TELEGRAPH_CENTER_CONFIG=/etc/telegraph-center/config.toml" unit.txt
+          touch $out
+        '';
 
         doc = craneLib.cargoDoc (
           commonArgs
