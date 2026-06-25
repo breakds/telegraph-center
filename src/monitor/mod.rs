@@ -27,6 +27,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use time::Duration;
 
+use crate::config::AppConfig;
 use crate::seam::{Clock, IdGenerator};
 use crate::storage::SqliteStore;
 
@@ -73,11 +74,13 @@ impl Sleeper for TokioSleeper {
 /// Shared state for the monitor routes. Cheap to clone.
 #[derive(Clone)]
 pub struct MonitorState {
-    /// SQLite-backed repository (sessions, login failures).
+    /// Validated application configuration (configured Sinks for Manual Routing).
+    pub config: Arc<AppConfig>,
+    /// SQLite-backed repository (sessions, login failures, Recordings).
     pub store: SqliteStore,
     /// Clock seam.
     pub clock: Arc<dyn Clock>,
-    /// Identifier generator (login-failure ids).
+    /// Identifier generator (login-failure, Delivery, and audit ids).
     pub ids: Arc<dyn IdGenerator>,
     /// Operator credential and session service.
     pub auth: Arc<AuthService>,
@@ -88,7 +91,20 @@ pub struct MonitorState {
 /// Build the monitor router.
 pub fn router(state: MonitorState) -> Router {
     Router::new()
-        .route("/monitor", get(handlers::monitor_index))
+        .route("/monitor", get(handlers::recording_list))
+        .route("/monitor/recordings/{id}", get(handlers::recording_detail))
+        .route(
+            "/monitor/recordings/{id}/manual-route",
+            post(handlers::manual_route),
+        )
+        .route(
+            "/monitor/recordings/{id}/retry-transcription",
+            post(handlers::retry_transcription),
+        )
+        .route(
+            "/monitor/recordings/{id}/retry-delivery",
+            post(handlers::retry_delivery),
+        )
         .route(
             "/monitor/login",
             get(handlers::login_get).post(handlers::login_post),

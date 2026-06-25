@@ -1,0 +1,26 @@
+{% extends "monitor/base.html" %}
+{% block body %}
+{% include "monitor/_nav.html" %}
+<main>
+<h1>Recordings</h1>
+<table>
+<thead>
+<tr><th>Received</th><th>Client</th><th>Recording</th><th>Status</th><th>Tags</th><th>Sink</th><th>Error</th></tr>
+</thead>
+<tbody>
+{% for row in rows %}
+<tr>
+<td><time>{{ row.received_at }}</time></td>
+<td>{{ row.client_id }}</td>
+<td><a href="/monitor/recordings/{{ row.id }}">{{ row.client_recording_id }}</a></td>
+<td>{{ row.status }}</td>
+<td>{{ row.tags }}</td>
+<td>{% if let Some(sink) = row.selected_sink_name %}{{ sink }}{% endif %}</td>
+<td>{% if let Some(err) = row.latest_error %}{{ err }}{% endif %}</td>
+</tr>
+{% endfor %}
+{% if rows.is_empty() %}<tr><td colspan="7">No recordings.</td></tr>{% endif %}
+</tbody>
+</table>
+</main>
+{% endblock %}

@@ -15,7 +15,9 @@ use tokio::sync::watch;
 use telegraph_center::blob::BlobStore;
 use telegraph_center::domain::{DeliveryStatus, RecordingStatus, Tags};
 use telegraph_center::seam::{Clock, IdGenerator};
-use telegraph_center::storage::{NewRecording, SqliteStore, StorageError};
+use telegraph_center::storage::{
+    ManualRetryDelivery, ManualRetryTranscription, NewRecording, SqliteStore, StorageError,
+};
 use telegraph_center::workers::{
     DeliveryRequest, Router, RoutingDecision, SinkClient, Transcriber, TranscriptionOutput,
     TranscriptionRequest, WorkOutcome, WorkerContext, WorkerFailure, delivery, retry, routing,
@@ -808,4 +810,144 @@ async fn worker_loop_stops_after_shutdown_without_another_tick() {
 #[test]
 fn delivery_window_is_24_hours() {
     assert_eq!(retry::DELIVERY_WINDOW, Duration::hours(24));
+}
+
+// --- Manual retry makes work immediately due (M7) --------------------------
+
+#[tokio::test]
+async fn manual_retry_transcription_is_due_within_backoff_window() {
+    let (_dir, store, blobs, ids) = harness().await;
+    let ctx = WorkerContext {
+        store: &store,
+        blobs: &blobs,
+        ids: &ids,
+    };
+    seed_received(&store, "rec-1", None).await;
+
+    // A failed attempt at t=0 leaves the Recording transcription_failed.
+    transcription::tick_once(
+        &ctx,
+        &FailingTranscriber(terminal()),
+        &StepClock::fixed(at(0)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.get_recording("rec-1").await.unwrap().unwrap().status,
+        RecordingStatus::TranscriptionFailed
+    );
+
+    // Operator retries at t=10s.
+    store
+        .manual_retry_transcription(ManualRetryTranscription {
+            recording_id: "rec-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            at: at(10),
+            actor_id: Some("break".to_string()),
+        })
+        .await
+        .unwrap();
+
+    // At t=20s — well within the 60s backoff from the t=0 failure — the worker
+    // still picks it up immediately because of the manual retry, and succeeds.
+    assert!(at(20) < retry::next_retry_at(at(0), 1));
+    assert_eq!(
+        transcription::tick_once(&ctx, &ok_transcriber(), &StepClock::fixed(at(20)))
+            .await
+            .unwrap(),
+        WorkOutcome::Worked
+    );
+    assert_eq!(
+        store.get_recording("rec-1").await.unwrap().unwrap().status,
+        RecordingStatus::Routing
+    );
+}
+
+#[tokio::test]
+async fn manual_retry_transcription_resets_the_deadline_window() {
+    let (_dir, store, blobs, ids) = harness().await;
+    let ctx = WorkerContext {
+        store: &store,
+        blobs: &blobs,
+        ids: &ids,
+    };
+    // No audio duration -> 2-hour retry window.
+    seed_received(&store, "rec-1", None).await;
+    transcription::tick_once(
+        &ctx,
+        &FailingTranscriber(terminal()),
+        &StepClock::fixed(at(0)),
+    )
+    .await
+    .unwrap();
+
+    // Retry long after the original 2h window (at t=0) would have closed.
+    let long_after = 10_000;
+    store
+        .manual_retry_transcription(ManualRetryTranscription {
+            recording_id: "rec-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            at: at(long_after),
+            actor_id: None,
+        })
+        .await
+        .unwrap();
+
+    // A retryable failure within the *fresh* window stays transcribing rather
+    // than going terminal — proving the deadline re-anchored on the retry.
+    transcription::tick_once(
+        &ctx,
+        &FailingTranscriber(retryable()),
+        &StepClock::steps(vec![at(long_after), at(long_after + 1)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.get_recording("rec-1").await.unwrap().unwrap().status,
+        RecordingStatus::Transcribing
+    );
+}
+
+#[tokio::test]
+async fn manual_retry_delivery_is_due_within_backoff_window() {
+    let (_dir, store, blobs, ids) = harness().await;
+    let ctx = WorkerContext {
+        store: &store,
+        blobs: &blobs,
+        ids: &ids,
+    };
+    let delivery_id = drive_to_delivering(&ctx, "rec-1", at(0)).await;
+
+    // A failed delivery attempt at t=0 leaves the Recording delivery_failed.
+    delivery::tick_once(&ctx, &FailingSink(terminal()), &StepClock::fixed(at(0)))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_recording("rec-1").await.unwrap().unwrap().status,
+        RecordingStatus::DeliveryFailed
+    );
+
+    store
+        .manual_retry_delivery(ManualRetryDelivery {
+            recording_id: "rec-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            at: at(10),
+            retry_deadline_at: at(10 + 86_400),
+            actor_id: Some("break".to_string()),
+        })
+        .await
+        .unwrap();
+
+    // At t=20s — within the 60s backoff from the t=0 failure — the worker picks
+    // it up immediately because of the manual retry, and delivers.
+    assert!(at(20) < retry::next_retry_at(at(0), 1));
+    assert_eq!(
+        delivery::tick_once(&ctx, &OkSink, &StepClock::fixed(at(20)))
+            .await
+            .unwrap(),
+        WorkOutcome::Worked
+    );
+    let recording = store.get_recording("rec-1").await.unwrap().unwrap();
+    assert_eq!(recording.status, RecordingStatus::Delivered);
+    let _ = delivery_id;
 }

@@ -10,9 +10,9 @@ use time::macros::datetime;
 
 use telegraph_center::domain::{DeliveryStatus, RecordingStatus, Tags};
 use telegraph_center::storage::{
-    ManualRoute, NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure,
-    NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt, RoutingOutcome,
-    SqliteStore, StorageError,
+    ManualRetryDelivery, ManualRetryTranscription, ManualRoute, MonitorStatusFilter, NewAuditEvent,
+    NewDelivery, NewDeliveryAttempt, NewLoginFailure, NewOperatorSession, NewRecording,
+    NewTranscript, NewTranscriptionAttempt, RoutingOutcome, SqliteStore, StorageError,
 };
 
 const T0: OffsetDateTime = datetime!(2026-06-23 12:00:00 UTC);
@@ -774,4 +774,293 @@ async fn concurrent_route_to_sink_selects_exactly_once() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// M7 monitor read models and manual retry
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_summaries_filters_by_status() {
+    let (_dir, store) = fresh_store().await;
+
+    // received
+    store
+        .create_recording(new_recording("r-recv", "litewatch-main", "r-recv"))
+        .await
+        .unwrap();
+
+    // backlogged
+    store
+        .create_recording(new_recording("r-back", "litewatch-main", "r-back"))
+        .await
+        .unwrap();
+    store
+        .update_recording_status("r-back", RecordingStatus::Transcribing, at(1))
+        .await
+        .unwrap();
+    store
+        .store_transcript(NewTranscript {
+            recording_id: "r-back".to_string(),
+            provider: "soniox".to_string(),
+            text: "hi".to_string(),
+            raw_json: "{}".to_string(),
+            provider_file_id: None,
+            provider_transcription_id: None,
+            created_at: at(2),
+        })
+        .await
+        .unwrap();
+    store.mark_backlogged("r-back", at(3)).await.unwrap();
+
+    // transcription_failed
+    store
+        .create_recording(new_recording("r-tf", "litewatch-main", "r-tf"))
+        .await
+        .unwrap();
+    store
+        .update_recording_status("r-tf", RecordingStatus::Transcribing, at(1))
+        .await
+        .unwrap();
+    store
+        .update_recording_status("r-tf", RecordingStatus::TranscriptionFailed, at(2))
+        .await
+        .unwrap();
+
+    // delivering
+    deliver_setup(&store, "r-delivering").await;
+
+    // delivered
+    let delivered_id = deliver_setup(&store, "r-delivered").await;
+    store
+        .mark_delivery_delivered(&delivered_id, at(10))
+        .await
+        .unwrap();
+
+    // delivery_failed
+    let failed_id = deliver_setup(&store, "r-df").await;
+    store
+        .mark_delivery_failed(&failed_id, at(10), "boom")
+        .await
+        .unwrap();
+
+    async fn ids(store: &SqliteStore, filter: MonitorStatusFilter) -> Vec<String> {
+        let mut ids: Vec<String> = store
+            .list_recording_summaries(filter, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    assert_eq!(ids(&store, MonitorStatusFilter::All).await.len(), 6);
+    assert_eq!(
+        ids(&store, MonitorStatusFilter::Backlogged).await,
+        vec!["r-back"]
+    );
+    assert_eq!(
+        ids(&store, MonitorStatusFilter::Failed).await,
+        vec!["r-df", "r-tf"]
+    );
+    assert_eq!(
+        ids(&store, MonitorStatusFilter::Delivering).await,
+        vec!["r-delivering"]
+    );
+    assert_eq!(
+        ids(&store, MonitorStatusFilter::Delivered).await,
+        vec!["r-delivered"]
+    );
+}
+
+#[tokio::test]
+async fn list_summaries_are_newest_first_and_respect_limit() {
+    let (_dir, store) = fresh_store().await;
+    for (i, seconds) in [0_i64, 100, 200].into_iter().enumerate() {
+        let mut new = new_recording(&format!("r-{i}"), "litewatch-main", &format!("cr-{i}"));
+        new.received_at = at(seconds);
+        store.create_recording(new).await.unwrap();
+    }
+
+    let summaries = store
+        .list_recording_summaries(MonitorStatusFilter::All, 2)
+        .await
+        .unwrap();
+    // Limit honored, newest received_at first.
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].id, "r-2");
+    assert_eq!(summaries[1].id, "r-1");
+}
+
+#[tokio::test]
+async fn recording_detail_composes_transcript_delivery_attempts_and_audit() {
+    let (_dir, store) = fresh_store().await;
+    let delivery_id = deliver_setup(&store, "rec-1").await;
+
+    store
+        .insert_transcription_attempt(NewTranscriptionAttempt {
+            id: "ta-1".to_string(),
+            recording_id: "rec-1".to_string(),
+            attempt_number: 1,
+            started_at: at(1),
+            finished_at: Some(at(2)),
+            status: "succeeded".to_string(),
+            retryable: false,
+            error_code: None,
+            error_message: None,
+        })
+        .await
+        .unwrap();
+    store
+        .insert_delivery_attempt(NewDeliveryAttempt {
+            id: "da-1".to_string(),
+            delivery_id: delivery_id.clone(),
+            attempt_number: 1,
+            started_at: at(3),
+            finished_at: Some(at(4)),
+            status: "failed".to_string(),
+            http_status: Some(503),
+            retryable: true,
+            error_message: Some("upstream".to_string()),
+        })
+        .await
+        .unwrap();
+    store
+        .insert_audit_event(NewAuditEvent {
+            id: "ae-1".to_string(),
+            occurred_at: at(5),
+            actor_kind: "operator".to_string(),
+            actor_id: Some("break".to_string()),
+            event_type: "manual_routing".to_string(),
+            recording_id: Some("rec-1".to_string()),
+            details_json: r#"{"sink":"journal"}"#.to_string(),
+        })
+        .await
+        .unwrap();
+
+    let detail = store.get_recording_detail("rec-1").await.unwrap().unwrap();
+    assert_eq!(detail.recording.id, "rec-1");
+    assert_eq!(detail.transcript.unwrap().text, "hello world");
+    assert_eq!(detail.delivery.unwrap().id, delivery_id);
+    assert_eq!(detail.transcription_attempts.len(), 1);
+    assert_eq!(detail.delivery_attempts.len(), 1);
+    assert_eq!(detail.audit_events.len(), 1);
+
+    assert!(store.get_recording_detail("nope").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn manual_retry_transcription_only_from_failed() {
+    let (_dir, store) = fresh_store().await;
+    store
+        .create_recording(new_recording("rec-1", "litewatch-main", "cr-1"))
+        .await
+        .unwrap();
+
+    // Wrong state (received) is rejected and changes nothing.
+    let err = store
+        .manual_retry_transcription(ManualRetryTranscription {
+            recording_id: "rec-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            at: at(5),
+            actor_id: Some("break".to_string()),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StorageError::RecordingNotRetryable { kind, .. } if kind == "transcription"
+    ));
+
+    store
+        .update_recording_status("rec-1", RecordingStatus::Transcribing, at(1))
+        .await
+        .unwrap();
+    store
+        .update_recording_status("rec-1", RecordingStatus::TranscriptionFailed, at(2))
+        .await
+        .unwrap();
+
+    let recording = store
+        .manual_retry_transcription(ManualRetryTranscription {
+            recording_id: "rec-1".to_string(),
+            audit_event_id: "ae-2".to_string(),
+            at: at(10),
+            actor_id: Some("break".to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recording.status, RecordingStatus::Transcribing);
+    assert!(recording.latest_error.is_none());
+
+    let events = store
+        .list_audit_events_for_recording("rec-1")
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "manual_retry_transcription")
+    );
+}
+
+#[tokio::test]
+async fn manual_retry_delivery_only_from_failed_and_preserves_sink() {
+    let (_dir, store) = fresh_store().await;
+    let delivery_id = deliver_setup(&store, "rec-1").await;
+
+    // Wrong state (delivering) is rejected.
+    let err = store
+        .manual_retry_delivery(ManualRetryDelivery {
+            recording_id: "rec-1".to_string(),
+            audit_event_id: "ae-1".to_string(),
+            at: at(5),
+            retry_deadline_at: at(5 + 86_400),
+            actor_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StorageError::RecordingNotRetryable { kind, .. } if kind == "delivery"
+    ));
+
+    store
+        .mark_delivery_failed(&delivery_id, at(6), "boom")
+        .await
+        .unwrap();
+
+    let delivery = store
+        .manual_retry_delivery(ManualRetryDelivery {
+            recording_id: "rec-1".to_string(),
+            audit_event_id: "ae-2".to_string(),
+            at: at(10),
+            retry_deadline_at: at(10 + 86_400),
+            actor_id: Some("break".to_string()),
+        })
+        .await
+        .unwrap();
+    // Same Delivery, same Sink, reset to delivering with a fresh deadline.
+    assert_eq!(delivery.id, delivery_id);
+    assert_eq!(delivery.sink_name, "journal");
+    assert_eq!(delivery.status, DeliveryStatus::Delivering);
+    assert!(delivery.completed_at.is_none());
+    assert!(delivery.latest_error.is_none());
+    assert_eq!(delivery.retry_deadline_at, Some(at(10 + 86_400)));
+
+    let recording = store.get_recording("rec-1").await.unwrap().unwrap();
+    assert_eq!(recording.status, RecordingStatus::Delivering);
+    assert!(recording.latest_error.is_none());
+
+    let events = store
+        .list_audit_events_for_recording("rec-1")
+        .await
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "manual_retry_delivery")
+    );
 }

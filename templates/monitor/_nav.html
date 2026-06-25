@@ -1,0 +1,11 @@
+<nav>
+<a href="/monitor?status=all"{% if active_filter == "all" %} aria-current="page"{% endif %}>All</a>
+<a href="/monitor?status=backlogged"{% if active_filter == "backlogged" %} aria-current="page"{% endif %}>Backlogged</a>
+<a href="/monitor?status=failed"{% if active_filter == "failed" %} aria-current="page"{% endif %}>Failed</a>
+<a href="/monitor?status=delivering"{% if active_filter == "delivering" %} aria-current="page"{% endif %}>Delivering</a>
+<a href="/monitor?status=delivered"{% if active_filter == "delivered" %} aria-current="page"{% endif %}>Delivered</a>
+<form method="post" action="/monitor/logout">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button type="submit">Log out</button>
+</form>
+</nav>

@@ -9,7 +9,10 @@ pub mod sqlite;
 
 use time::OffsetDateTime;
 
-use crate::domain::{Delivery, InvalidTransition, Recording, Tags, Transcript};
+use crate::domain::{
+    AuditEvent, Delivery, DeliveryAttempt, InvalidTransition, Recording, RecordingStatus, Tags,
+    Transcript, TranscriptionAttempt,
+};
 
 pub use sqlite::SqliteStore;
 
@@ -38,6 +41,16 @@ pub enum StorageError {
         id: String,
         /// The Recording's current status.
         status: String,
+    },
+    /// Manual Retry was attempted on a Recording not in the matching failed state.
+    #[error("recording {id:?} is not in a retryable {kind} state (status {status})")]
+    RecordingNotRetryable {
+        /// The Recording id.
+        id: String,
+        /// The Recording's current status.
+        status: String,
+        /// Which kind of retry was attempted (`transcription` or `delivery`).
+        kind: String,
     },
     /// Data read back from storage could not be interpreted.
     #[error("corrupt stored data: {0}")]
@@ -70,6 +83,101 @@ pub struct ManualRoute {
     pub retry_deadline_at: OffsetDateTime,
     /// Operator identifier for the audit event, if known.
     pub actor_id: Option<String>,
+}
+
+/// Input for an Operator Manual Retry of failed Transcription.
+#[derive(Debug, Clone)]
+pub struct ManualRetryTranscription {
+    /// The `transcription_failed` Recording to retry.
+    pub recording_id: String,
+    /// Stable id for the appended audit event.
+    pub audit_event_id: String,
+    /// When the retry was requested.
+    pub at: OffsetDateTime,
+    /// Operator identifier for the audit event, if known.
+    pub actor_id: Option<String>,
+}
+
+/// Input for an Operator Manual Retry of failed Delivery.
+#[derive(Debug, Clone)]
+pub struct ManualRetryDelivery {
+    /// The `delivery_failed` Recording to retry.
+    pub recording_id: String,
+    /// Stable id for the appended audit event.
+    pub audit_event_id: String,
+    /// When the retry was requested.
+    pub at: OffsetDateTime,
+    /// Fresh deadline after which Delivery retries stop again.
+    pub retry_deadline_at: OffsetDateTime,
+    /// Operator identifier for the audit event, if known.
+    pub actor_id: Option<String>,
+}
+
+/// Which Recordings the monitor list should show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorStatusFilter {
+    /// All recent Recordings.
+    All,
+    /// Only `backlogged`.
+    Backlogged,
+    /// `transcription_failed` and `delivery_failed`.
+    Failed,
+    /// In-flight work: `transcribing`, `routing`, and `delivering`.
+    Delivering,
+    /// Only `delivered`.
+    Delivered,
+}
+
+impl MonitorStatusFilter {
+    /// The Recording statuses this filter selects, or `None` for no restriction.
+    pub fn statuses(self) -> Option<&'static [RecordingStatus]> {
+        use RecordingStatus::*;
+        match self {
+            MonitorStatusFilter::All => None,
+            MonitorStatusFilter::Backlogged => Some(&[Backlogged]),
+            MonitorStatusFilter::Failed => Some(&[TranscriptionFailed, DeliveryFailed]),
+            MonitorStatusFilter::Delivering => Some(&[Transcribing, Routing, Delivering]),
+            MonitorStatusFilter::Delivered => Some(&[Delivered]),
+        }
+    }
+}
+
+/// A compact Recording row for the monitor list page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingSummary {
+    /// Server Recording id.
+    pub id: String,
+    /// Submitting Client.
+    pub client_id: String,
+    /// Client-assigned Recording id.
+    pub client_recording_id: String,
+    /// Coarse lifecycle status.
+    pub status: RecordingStatus,
+    /// Normalized tags.
+    pub tags: Tags,
+    /// Selected Sink name, if any.
+    pub selected_sink_name: Option<String>,
+    /// Most recent error, if any.
+    pub latest_error: Option<String>,
+    /// Server receive time.
+    pub received_at: OffsetDateTime,
+}
+
+/// The full read model for a Recording detail page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordingDetail {
+    /// The Recording itself.
+    pub recording: Recording,
+    /// Its Transcript, when transcription has succeeded.
+    pub transcript: Option<Transcript>,
+    /// Its Delivery, when a Sink was selected.
+    pub delivery: Option<Delivery>,
+    /// Transcription Attempts, oldest first.
+    pub transcription_attempts: Vec<TranscriptionAttempt>,
+    /// Delivery Attempts, oldest first.
+    pub delivery_attempts: Vec<DeliveryAttempt>,
+    /// Audit events for the Recording, oldest first.
+    pub audit_events: Vec<AuditEvent>,
 }
 
 /// The outcome of a create-or-get Recording call.
@@ -235,6 +343,9 @@ pub struct TranscriptionRetryCandidate {
     /// When the latest Transcription Attempt finished. Backoff is measured from
     /// the failure, not from when the attempt started.
     pub last_attempt_finished_at: OffsetDateTime,
+    /// When an Operator last requested a manual retry, if any. When this is after
+    /// `last_attempt_finished_at`, the work is due immediately (backoff bypassed).
+    pub retry_window_started_at: Option<OffsetDateTime>,
 }
 
 /// The result of claiming an in-flight Transcription Attempt.
@@ -262,6 +373,9 @@ pub struct DeliveryCandidate {
     /// When the latest finished Delivery Attempt finished, if any. Backoff is
     /// measured from the failure, not from when the attempt started.
     pub last_attempt_finished_at: Option<OffsetDateTime>,
+    /// When an Operator last requested a manual retry, if any. When this is after
+    /// `last_attempt_finished_at`, the work is due immediately (backoff bypassed).
+    pub retry_window_started_at: Option<OffsetDateTime>,
 }
 
 /// Input for appending an audit event.

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telegraph Monitor</title>
+<style>
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; margin: 0; line-height: 1.4; }
+main { padding: 1rem; }
+nav { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+      padding: 0.5rem 1rem; border-bottom: 1px solid #8884; }
+nav a { text-decoration: none; }
+nav a[aria-current="page"] { font-weight: bold; text-decoration: underline; }
+nav form { margin-left: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid #8883;
+         vertical-align: top; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.2rem 1rem; }
+dt { font-weight: bold; }
+pre { white-space: pre-wrap; word-break: break-word; background: #8881; padding: 0.5rem; }
+section { margin-block: 1.5rem; }
+form label { display: block; margin-block: 0.4rem; }
+[role="alert"] { color: #b00; }
+@media (max-width: 600px) {
+  table, thead, tbody, tr, th, td { display: block; }
+  thead { display: none; }
+  tr { border-bottom: 2px solid #8884; padding-block: 0.4rem; }
+  td { border: none; padding: 0.15rem 0.5rem; }
+}
+</style>
+</head>
+<body>
+{% block body %}{% endblock %}
+</body>
+</html>

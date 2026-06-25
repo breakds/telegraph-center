@@ -97,18 +97,22 @@ pub async fn tick_once<T: Transcriber>(
     Ok(WorkOutcome::Worked)
 }
 
-/// The oldest `transcribing` Recording whose latest attempt's backoff is due,
-/// measured from that attempt's finish time.
+/// The oldest `transcribing` Recording that is due: either its latest attempt's
+/// backoff has elapsed, or an Operator opened a fresh retry window after that
+/// attempt (Manual Retry), which is due immediately.
 async fn pick_due_retry(
     ctx: &WorkerContext<'_>,
     now: OffsetDateTime,
 ) -> Result<Option<Recording>, StorageError> {
     for candidate in ctx.store.transcription_retry_candidates().await? {
+        let manual_retry = candidate
+            .retry_window_started_at
+            .is_some_and(|window| window > candidate.last_attempt_finished_at);
         let due = retry::next_retry_at(
             candidate.last_attempt_finished_at,
             candidate.last_attempt_number,
         );
-        if now >= due {
+        if manual_retry || now >= due {
             return Ok(Some(candidate.recording));
         }
     }

@@ -16,19 +16,23 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use tempfile::TempDir;
-use time::OffsetDateTime;
 use time::macros::datetime;
+use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
 use telegraph_center::blob::BlobStore;
 use telegraph_center::config::{
-    AppConfig, ClientConfig, DataConfig, OperatorConfig, ServerConfig, SonioxConfig,
+    AppConfig, ClientConfig, DataConfig, OperatorConfig, ServerConfig, Sink, SonioxConfig,
+    WebhookSink,
 };
+use telegraph_center::domain::{RecordingStatus, Tags};
 use telegraph_center::http::{AppState, Clock, IdGenerator};
 use telegraph_center::monitor::auth::{AuthService, StaticPasswordHash};
 use telegraph_center::monitor::futures_sleep::BoxSleep;
 use telegraph_center::monitor::{MonitorState, Sleeper};
-use telegraph_center::storage::{NewLoginFailure, SqliteStore};
+use telegraph_center::storage::{
+    NewDelivery, NewDeliveryAttempt, NewLoginFailure, NewRecording, NewTranscript, SqliteStore,
+};
 
 const NOW: OffsetDateTime = datetime!(2026-06-24 12:00:00 UTC);
 const USERNAME: &str = "break";
@@ -69,6 +73,41 @@ fn fixture_hash() -> String {
         .to_string()
 }
 
+/// A config with one configured Sink, for Manual Routing tests.
+fn test_config() -> AppConfig {
+    AppConfig {
+        server: ServerConfig {
+            listen: "127.0.0.1:8080".into(),
+            public_base_path: String::new(),
+        },
+        data: DataConfig {
+            dir: "/tmp/telegraph-test".into(),
+            max_upload_bytes: 1_000_000,
+        },
+        clients: vec![ClientConfig {
+            name: "litewatch-main".into(),
+            certificate_fingerprint: "sha256:good".into(),
+        }],
+        operator: OperatorConfig {
+            username: USERNAME.into(),
+            password_hash_env: "TELEGRAPH_OPERATOR_PASSWORD_HASH".into(),
+        },
+        soniox: SonioxConfig {
+            api_key_env: "SONIOX_API_KEY".into(),
+            model: "stt-async-v5".into(),
+            language_hints: vec!["en".into()],
+            enable_speaker_diarization: true,
+            enable_language_identification: false,
+        },
+        sinks: vec![Sink::Webhook(WebhookSink {
+            name: "journal".into(),
+            url: "http://127.0.0.1:8644/webhooks/journal".into(),
+            secret_env: "HERMES_JOURNAL_WEBHOOK_SECRET".into(),
+            match_tags: Tags::new(["journal"]).unwrap(),
+        })],
+    }
+}
+
 struct Harness {
     _dir: TempDir,
     store: SqliteStore,
@@ -84,6 +123,7 @@ impl Harness {
             .unwrap();
         let delays = Arc::new(Mutex::new(Vec::new()));
         let state = MonitorState {
+            config: Arc::new(test_config()),
             store: store.clone(),
             clock: Arc::new(FixedClock(NOW)),
             ids: Arc::new(SequentialIds(AtomicU64::new(1))),
@@ -279,11 +319,12 @@ async fn lockout_blocks_login_without_revealing_account_existence() {
     assert!(set_cookie(&real.headers).is_none());
     assert_eq!(harness.session_count().await, 0);
 
-    // An unknown account gets the identical generic response.
+    // An unknown account gets a byte-for-byte identical generic response, so the
+    // lockout reveals nothing about whether the username exists.
     let ghost = send(harness.router(), login_request("ghost", "whatever")).await;
     assert_eq!(ghost.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(real.body, ghost.body);
-    assert!(!real.body.contains(USERNAME));
+    assert!(real.body.contains("Too many attempts"));
 }
 
 #[tokio::test]
@@ -320,7 +361,7 @@ async fn authenticated_monitor_page_renders() {
 
     let sent = send(harness.router(), get("/monitor", Some(&token))).await;
     assert_eq!(sent.status, StatusCode::OK);
-    assert!(sent.body.contains("Signed in as break"));
+    assert!(sent.body.contains("Recordings"));
     assert!(sent.body.contains("Log out"));
 }
 
@@ -394,41 +435,17 @@ async fn api_remains_independent_of_operator_auth() {
         .await
         .unwrap();
     let blobs = BlobStore::new(dir.path()).await.unwrap();
-    let config = AppConfig {
-        server: ServerConfig {
-            listen: "127.0.0.1:8080".into(),
-            public_base_path: String::new(),
-        },
-        data: DataConfig {
-            dir: dir.path().to_path_buf(),
-            max_upload_bytes: 1_000_000,
-        },
-        clients: vec![ClientConfig {
-            name: "litewatch-main".into(),
-            certificate_fingerprint: "sha256:good".into(),
-        }],
-        operator: OperatorConfig {
-            username: USERNAME.into(),
-            password_hash_env: "TELEGRAPH_OPERATOR_PASSWORD_HASH".into(),
-        },
-        soniox: SonioxConfig {
-            api_key_env: "SONIOX_API_KEY".into(),
-            model: "stt-async-v5".into(),
-            language_hints: vec!["en".into()],
-            enable_speaker_diarization: true,
-            enable_language_identification: false,
-        },
-        sinks: vec![],
-    };
+    let config = Arc::new(test_config());
 
     let api = AppState {
-        config: Arc::new(config),
+        config: config.clone(),
         store: store.clone(),
         blobs: Arc::new(blobs),
         clock: Arc::new(FixedClock(NOW)),
         ids: Arc::new(SequentialIds(AtomicU64::new(1))),
     };
     let monitor = MonitorState {
+        config,
         store,
         clock: Arc::new(FixedClock(NOW)),
         ids: Arc::new(SequentialIds(AtomicU64::new(1))),
@@ -458,4 +475,433 @@ async fn api_remains_independent_of_operator_auth() {
     let sent = send(app, request).await;
     assert_eq!(sent.status, StatusCode::UNAUTHORIZED);
     assert!(sent.body.contains("missing_client_identity"));
+}
+
+// ---------------------------------------------------------------------------
+// M7 monitor UI: list, detail, filters, manual routing, manual retry
+// ---------------------------------------------------------------------------
+
+fn seed_recording(id: &str, received_offset: i64) -> NewRecording {
+    NewRecording {
+        id: id.to_string(),
+        client_id: "litewatch-main".to_string(),
+        client_recording_id: format!("cr-{id}"),
+        original_filename: Some("rec.wav".to_string()),
+        blob_path: Some(format!("recordings/{id}.wav")),
+        audio_size_bytes: Some(1_024),
+        audio_duration_ms: Some(5_000),
+        sample_rate_hz: Some(16_000),
+        channels: Some(1),
+        bits_per_sample: Some(16),
+        tags: Tags::new(["journal"]).unwrap(),
+        recorded_at: None,
+        received_at: NOW + Duration::seconds(received_offset),
+    }
+}
+
+async fn store_transcript(store: &SqliteStore, id: &str) {
+    store
+        .update_recording_status(id, RecordingStatus::Transcribing, NOW)
+        .await
+        .unwrap();
+    store
+        .store_transcript(NewTranscript {
+            recording_id: id.to_string(),
+            provider: "soniox".to_string(),
+            text: "hello transcript world".to_string(),
+            raw_json: r#"{"tokens":["hello"]}"#.to_string(),
+            provider_file_id: None,
+            provider_transcription_id: None,
+            created_at: NOW,
+        })
+        .await
+        .unwrap();
+}
+
+async fn seed_backlogged(store: &SqliteStore, id: &str) {
+    store.create_recording(seed_recording(id, 0)).await.unwrap();
+    store_transcript(store, id).await;
+    store.mark_backlogged(id, NOW).await.unwrap();
+}
+
+async fn seed_delivering(store: &SqliteStore, id: &str) -> String {
+    store.create_recording(seed_recording(id, 0)).await.unwrap();
+    store_transcript(store, id).await;
+    let delivery_id = format!("{id}-delivery");
+    store
+        .select_sink(NewDelivery {
+            id: delivery_id.clone(),
+            recording_id: id.to_string(),
+            sink_name: "journal".to_string(),
+            selected_at: NOW,
+            retry_deadline_at: Some(NOW + Duration::hours(24)),
+        })
+        .await
+        .unwrap();
+    delivery_id
+}
+
+async fn seed_transcription_failed(store: &SqliteStore, id: &str) {
+    store.create_recording(seed_recording(id, 0)).await.unwrap();
+    store
+        .update_recording_status(id, RecordingStatus::Transcribing, NOW)
+        .await
+        .unwrap();
+    store
+        .update_recording_status(id, RecordingStatus::TranscriptionFailed, NOW)
+        .await
+        .unwrap();
+}
+
+async fn seed_delivery_failed(store: &SqliteStore, id: &str) -> String {
+    let delivery_id = seed_delivering(store, id).await;
+    store
+        .mark_delivery_failed(&delivery_id, NOW, "upstream said no")
+        .await
+        .unwrap();
+    delivery_id
+}
+
+/// Log in and return the session token plus the page's CSRF token.
+async fn login_with_csrf(harness: &Harness) -> (String, String) {
+    let token = login(harness).await;
+    let page = send(harness.router(), get("/monitor", Some(&token))).await;
+    (token.clone(), extract_csrf(&page.body))
+}
+
+async fn recording_status(harness: &Harness, id: &str) -> RecordingStatus {
+    harness
+        .store
+        .get_recording(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .status
+}
+
+#[tokio::test]
+async fn unauthenticated_detail_and_actions_redirect_to_login() {
+    let harness = Harness::new().await;
+
+    let detail = send(harness.router(), get("/monitor/recordings/x", None)).await;
+    assert_eq!(detail.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        detail.headers.get(header::LOCATION).unwrap(),
+        "/monitor/login"
+    );
+
+    let action = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/x/manual-route",
+            None,
+            "csrf_token=whatever&sink=journal".into(),
+        ),
+    )
+    .await;
+    assert_eq!(action.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        action.headers.get(header::LOCATION).unwrap(),
+        "/monitor/login"
+    );
+}
+
+#[tokio::test]
+async fn list_shows_recordings_newest_first() {
+    let harness = Harness::new().await;
+    for (i, offset) in [0_i64, 100, 200].into_iter().enumerate() {
+        harness
+            .store
+            .create_recording(seed_recording(&format!("r{i}"), offset))
+            .await
+            .unwrap();
+    }
+    let token = login(&harness).await;
+    let page = send(harness.router(), get("/monitor", Some(&token))).await;
+    assert_eq!(page.status, StatusCode::OK);
+
+    // Newest (r2, offset 200) appears before r1 before r0.
+    let p2 = page.body.find("cr-r2").unwrap();
+    let p1 = page.body.find("cr-r1").unwrap();
+    let p0 = page.body.find("cr-r0").unwrap();
+    assert!(p2 < p1 && p1 < p0, "rows should be newest-first");
+}
+
+#[tokio::test]
+async fn list_filters_select_expected_statuses() {
+    let harness = Harness::new().await;
+    seed_backlogged(&harness.store, "r-back").await;
+    seed_transcription_failed(&harness.store, "r-tf").await;
+    seed_delivering(&harness.store, "r-del").await;
+    let token = login(&harness).await;
+
+    let backlogged = send(
+        harness.router(),
+        get("/monitor?status=backlogged", Some(&token)),
+    )
+    .await;
+    assert!(backlogged.body.contains("cr-r-back"));
+    assert!(!backlogged.body.contains("cr-r-tf"));
+    assert!(!backlogged.body.contains("cr-r-del"));
+
+    let failed = send(
+        harness.router(),
+        get("/monitor?status=failed", Some(&token)),
+    )
+    .await;
+    assert!(failed.body.contains("cr-r-tf"));
+    assert!(!failed.body.contains("cr-r-back"));
+
+    let delivering = send(
+        harness.router(),
+        get("/monitor?status=delivering", Some(&token)),
+    )
+    .await;
+    assert!(delivering.body.contains("cr-r-del"));
+    assert!(!delivering.body.contains("cr-r-back"));
+}
+
+#[tokio::test]
+async fn detail_shows_metadata_transcript_sink_and_raw_json_without_audio_link() {
+    let harness = Harness::new().await;
+    let delivery_id = seed_delivering(&harness.store, "rec-1").await;
+    harness
+        .store
+        .insert_delivery_attempt(NewDeliveryAttempt {
+            id: "da-1".to_string(),
+            delivery_id,
+            attempt_number: 1,
+            started_at: NOW,
+            finished_at: Some(NOW + Duration::seconds(1)),
+            status: "failed".to_string(),
+            http_status: Some(503),
+            retryable: true,
+            error_message: Some("upstream".to_string()),
+        })
+        .await
+        .unwrap();
+    let token = login(&harness).await;
+
+    let page = send(
+        harness.router(),
+        get("/monitor/recordings/rec-1", Some(&token)),
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("hello transcript world"));
+    assert!(page.body.contains("journal"));
+    assert!(page.body.contains("<details>"));
+    assert!(page.body.contains("tokens")); // raw provider JSON rendered
+    assert!(page.body.contains("Delivery attempts"));
+
+    // No audio playback or download is ever exposed.
+    assert!(!page.body.contains("<audio"));
+    assert!(!page.body.contains("recordings/rec-1.wav"));
+    assert!(!page.body.contains("download"));
+}
+
+#[tokio::test]
+async fn unknown_recording_detail_is_not_found() {
+    let harness = Harness::new().await;
+    let token = login(&harness).await;
+    let page = send(
+        harness.router(),
+        get("/monitor/recordings/nope", Some(&token)),
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn manual_routing_form_shows_only_for_backlogged() {
+    let harness = Harness::new().await;
+    seed_backlogged(&harness.store, "r-back").await;
+    seed_delivering(&harness.store, "r-del").await;
+    let token = login(&harness).await;
+
+    let backlogged = send(
+        harness.router(),
+        get("/monitor/recordings/r-back", Some(&token)),
+    )
+    .await;
+    assert!(
+        backlogged
+            .body
+            .contains("/monitor/recordings/r-back/manual-route")
+    );
+    assert!(backlogged.body.contains("value=\"journal\""));
+
+    let delivering = send(
+        harness.router(),
+        get("/monitor/recordings/r-del", Some(&token)),
+    )
+    .await;
+    assert!(!delivering.body.contains("manual-route"));
+}
+
+#[tokio::test]
+async fn manual_route_requires_csrf_and_creates_delivery() {
+    let harness = Harness::new().await;
+    seed_backlogged(&harness.store, "r-back").await;
+    let (token, csrf) = login_with_csrf(&harness).await;
+
+    // Bad CSRF changes nothing.
+    let bad = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-back/manual-route",
+            Some(&token),
+            "csrf_token=wrong&sink=journal".into(),
+        ),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        recording_status(&harness, "r-back").await,
+        RecordingStatus::Backlogged
+    );
+
+    // Unknown sink is rejected.
+    let unknown = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-back/manual-route",
+            Some(&token),
+            format!("csrf_token={csrf}&sink=ghost"),
+        ),
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
+    assert!(
+        harness
+            .store
+            .get_delivery_for_recording("r-back")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Valid routing moves to delivering and creates the Delivery.
+    let ok = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-back/manual-route",
+            Some(&token),
+            format!("csrf_token={csrf}&sink=journal"),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        ok.headers.get(header::LOCATION).unwrap(),
+        "/monitor/recordings/r-back"
+    );
+    assert_eq!(
+        recording_status(&harness, "r-back").await,
+        RecordingStatus::Delivering
+    );
+    let delivery = harness
+        .store
+        .get_delivery_for_recording("r-back")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.sink_name, "journal");
+}
+
+#[tokio::test]
+async fn manual_retry_transcription_requires_csrf_and_transitions() {
+    let harness = Harness::new().await;
+    seed_transcription_failed(&harness.store, "r-tf").await;
+    let (token, csrf) = login_with_csrf(&harness).await;
+
+    let bad = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-tf/retry-transcription",
+            Some(&token),
+            "csrf_token=wrong".into(),
+        ),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        recording_status(&harness, "r-tf").await,
+        RecordingStatus::TranscriptionFailed
+    );
+
+    let ok = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-tf/retry-transcription",
+            Some(&token),
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        recording_status(&harness, "r-tf").await,
+        RecordingStatus::Transcribing
+    );
+}
+
+#[tokio::test]
+async fn manual_retry_delivery_requires_csrf_and_transitions() {
+    let harness = Harness::new().await;
+    seed_delivery_failed(&harness.store, "r-df").await;
+    let (token, csrf) = login_with_csrf(&harness).await;
+
+    let bad = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-df/retry-delivery",
+            Some(&token),
+            "csrf_token=wrong".into(),
+        ),
+    )
+    .await;
+    assert_eq!(bad.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        recording_status(&harness, "r-df").await,
+        RecordingStatus::DeliveryFailed
+    );
+
+    let ok = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-df/retry-delivery",
+            Some(&token),
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        recording_status(&harness, "r-df").await,
+        RecordingStatus::Delivering
+    );
+}
+
+#[tokio::test]
+async fn retry_on_wrong_status_is_conflict() {
+    let harness = Harness::new().await;
+    seed_delivering(&harness.store, "r-del").await;
+    let (token, csrf) = login_with_csrf(&harness).await;
+
+    // Recording is delivering, not transcription_failed.
+    let sent = send(
+        harness.router(),
+        post_form(
+            "/monitor/recordings/r-del/retry-transcription",
+            Some(&token),
+            format!("csrf_token={csrf}"),
+        ),
+    )
+    .await;
+    assert_eq!(sent.status, StatusCode::CONFLICT);
+    assert_eq!(
+        recording_status(&harness, "r-del").await,
+        RecordingStatus::Delivering
+    );
 }

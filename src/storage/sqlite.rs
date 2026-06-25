@@ -17,9 +17,10 @@ use crate::domain::{
 };
 
 use super::{
-    DeliveryCandidate, ManualRoute, NewAuditEvent, NewDelivery, NewDeliveryAttempt,
-    NewLoginFailure, NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt,
-    RecordingCreation, RoutingOutcome, StorageError, TranscriptionAttemptStart,
+    DeliveryCandidate, ManualRetryDelivery, ManualRetryTranscription, ManualRoute,
+    MonitorStatusFilter, NewAuditEvent, NewDelivery, NewDeliveryAttempt, NewLoginFailure,
+    NewOperatorSession, NewRecording, NewTranscript, NewTranscriptionAttempt, RecordingCreation,
+    RecordingDetail, RecordingSummary, RoutingOutcome, StorageError, TranscriptionAttemptStart,
     TranscriptionRetryCandidate,
 };
 
@@ -344,6 +345,192 @@ impl SqliteStore {
 
         tx.commit().await?;
         self.require_delivery(&input.delivery_id).await
+    }
+
+    /// Manually retry failed Transcription.
+    ///
+    /// Allowed only from `transcription_failed`. Transitions back to
+    /// `transcribing`, clears `latest_error`, and appends a
+    /// `manual_retry_transcription` audit event. The next Transcription worker
+    /// tick picks the Recording up as retry work.
+    pub async fn manual_retry_transcription(
+        &self,
+        input: ManualRetryTranscription,
+    ) -> Result<Recording, StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        let status = current_status(&mut tx, &input.recording_id).await?;
+        if status != RecordingStatus::TranscriptionFailed {
+            return Err(StorageError::RecordingNotRetryable {
+                id: input.recording_id,
+                status: status.to_string(),
+                kind: "transcription".to_string(),
+            });
+        }
+
+        guarded_transition(
+            &mut tx,
+            &input.recording_id,
+            RecordingStatus::Transcribing,
+            input.at,
+        )
+        .await?;
+        clear_recording_error(&mut tx, &input.recording_id).await?;
+        // Open a fresh retry window: the next worker tick treats this as due now
+        // and anchors the retry deadline here rather than the original attempt.
+        sqlx::query("UPDATE recordings SET retry_window_started_at = ? WHERE id = ?")
+            .bind(timestamp::format(input.at))
+            .bind(&input.recording_id)
+            .execute(&mut *tx)
+            .await?;
+
+        insert_audit_event_tx(
+            &mut tx,
+            &NewAuditEvent {
+                id: input.audit_event_id,
+                occurred_at: input.at,
+                actor_kind: "operator".to_string(),
+                actor_id: input.actor_id,
+                event_type: "manual_retry_transcription".to_string(),
+                recording_id: Some(input.recording_id.clone()),
+                details_json: "{}".to_string(),
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.require_recording(&input.recording_id).await
+    }
+
+    /// Manually retry failed Delivery.
+    ///
+    /// Allowed only from `delivery_failed`. Resets the already selected Delivery
+    /// to `delivering` with a fresh retry deadline (preserving its Sink),
+    /// transitions the Recording back to `delivering`, clears errors, and appends
+    /// a `manual_retry_delivery` audit event. This never re-enters the Backlog: a
+    /// failed Delivery already has a selected Sink.
+    pub async fn manual_retry_delivery(
+        &self,
+        input: ManualRetryDelivery,
+    ) -> Result<Delivery, StorageError> {
+        let mut tx = self.pool.begin().await?;
+
+        let status = current_status(&mut tx, &input.recording_id).await?;
+        if status != RecordingStatus::DeliveryFailed {
+            return Err(StorageError::RecordingNotRetryable {
+                id: input.recording_id,
+                status: status.to_string(),
+                kind: "delivery".to_string(),
+            });
+        }
+
+        let delivery_id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM deliveries WHERE recording_id = ?")
+                .bind(&input.recording_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let delivery_id = delivery_id
+            .ok_or_else(|| StorageError::DeliveryNotFound(input.recording_id.clone()))?;
+
+        sqlx::query(
+            "UPDATE deliveries
+             SET status = ?, completed_at = NULL, retry_deadline_at = ?, latest_error = NULL,
+                 retry_window_started_at = ?
+             WHERE id = ?",
+        )
+        .bind(DeliveryStatus::Delivering.as_str())
+        .bind(timestamp::format(input.retry_deadline_at))
+        .bind(timestamp::format(input.at))
+        .bind(&delivery_id)
+        .execute(&mut *tx)
+        .await?;
+
+        guarded_transition(
+            &mut tx,
+            &input.recording_id,
+            RecordingStatus::Delivering,
+            input.at,
+        )
+        .await?;
+        clear_recording_error(&mut tx, &input.recording_id).await?;
+
+        insert_audit_event_tx(
+            &mut tx,
+            &NewAuditEvent {
+                id: input.audit_event_id,
+                occurred_at: input.at,
+                actor_kind: "operator".to_string(),
+                actor_id: input.actor_id,
+                event_type: "manual_retry_delivery".to_string(),
+                recording_id: Some(input.recording_id.clone()),
+                details_json: "{}".to_string(),
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.require_delivery(&delivery_id).await
+    }
+
+    // -- Monitor read models ------------------------------------------------
+
+    /// List recent Recordings for the monitor, newest first, filtered by status.
+    pub async fn list_recording_summaries(
+        &self,
+        filter: MonitorStatusFilter,
+        limit: i64,
+    ) -> Result<Vec<RecordingSummary>, StorageError> {
+        let where_clause = match filter.statuses() {
+            None => String::new(),
+            Some(statuses) => {
+                let quoted: Vec<String> = statuses
+                    .iter()
+                    .map(|status| format!("'{}'", status.as_str()))
+                    .collect();
+                format!("WHERE status IN ({})", quoted.join(", "))
+            }
+        };
+        let sql = format!(
+            "SELECT id, client_id, client_recording_id, status, tags_json,
+                    selected_sink_name, latest_error, received_at
+             FROM recordings {where_clause}
+             ORDER BY received_at DESC, created_at DESC
+             LIMIT ?"
+        );
+        let rows = sqlx::query_as::<_, RecordingSummaryRow>(&sql)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(RecordingSummaryRow::into_domain)
+            .collect()
+    }
+
+    /// Compose the full detail read model for a Recording, or `None` if unknown.
+    pub async fn get_recording_detail(
+        &self,
+        recording_id: &str,
+    ) -> Result<Option<RecordingDetail>, StorageError> {
+        let Some(recording) = self.get_recording(recording_id).await? else {
+            return Ok(None);
+        };
+        let transcript = self.get_transcript(recording_id).await?;
+        let delivery = self.get_delivery_for_recording(recording_id).await?;
+        let transcription_attempts = self.list_transcription_attempts(recording_id).await?;
+        let delivery_attempts = match &delivery {
+            Some(delivery) => self.list_delivery_attempts(&delivery.id).await?,
+            None => Vec::new(),
+        };
+        let audit_events = self.list_audit_events_for_recording(recording_id).await?;
+
+        Ok(Some(RecordingDetail {
+            recording,
+            transcript,
+            delivery,
+            transcription_attempts,
+            delivery_attempts,
+            audit_events,
+        }))
     }
 
     /// Fetch a Delivery by its identifier.
@@ -692,13 +879,14 @@ impl SqliteStore {
     pub async fn transcription_retry_candidates(
         &self,
     ) -> Result<Vec<TranscriptionRetryCandidate>, StorageError> {
-        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        let rows: Vec<(String, i64, String, Option<String>)> = sqlx::query_as(
             "SELECT r.id,
                     (SELECT MAX(attempt_number) FROM transcription_attempts a
                        WHERE a.recording_id = r.id),
                     (SELECT finished_at FROM transcription_attempts a
                        WHERE a.recording_id = r.id
-                       ORDER BY attempt_number DESC LIMIT 1)
+                       ORDER BY attempt_number DESC LIMIT 1),
+                    r.retry_window_started_at
              FROM recordings r
              WHERE r.status = 'transcribing'
                AND EXISTS (SELECT 1 FROM transcription_attempts a
@@ -711,12 +899,13 @@ impl SqliteStore {
         .await?;
 
         let mut candidates = Vec::with_capacity(rows.len());
-        for (recording_id, last_attempt_number, last_finished) in rows {
+        for (recording_id, last_attempt_number, last_finished, retry_window) in rows {
             let recording = self.require_recording(&recording_id).await?;
             candidates.push(TranscriptionRetryCandidate {
                 recording,
                 last_attempt_number,
                 last_attempt_finished_at: parse_ts(&last_finished)?,
+                retry_window_started_at: parse_ts_opt(retry_window)?,
             });
         }
         Ok(candidates)
@@ -764,12 +953,25 @@ impl SqliteStore {
         .execute(&mut *tx)
         .await?;
 
-        let first_started: String = sqlx::query_scalar(
-            "SELECT MIN(started_at) FROM transcription_attempts WHERE recording_id = ?",
-        )
-        .bind(recording_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        // Anchor the retry deadline window. A manual retry sets
+        // `retry_window_started_at`, which gives the work a fresh window; without
+        // one, the window runs from the first attempt ever, as before.
+        let retry_window: Option<String> =
+            sqlx::query_scalar("SELECT retry_window_started_at FROM recordings WHERE id = ?")
+                .bind(recording_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let first_started: String = match retry_window {
+            Some(window) => window,
+            None => {
+                sqlx::query_scalar(
+                    "SELECT MIN(started_at) FROM transcription_attempts WHERE recording_id = ?",
+                )
+                .bind(recording_id)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
 
         tx.commit().await?;
         Ok(Some(TranscriptionAttemptStart {
@@ -891,13 +1093,16 @@ impl SqliteStore {
     /// List `delivering` Deliveries with no in-flight Delivery Attempt, oldest
     /// selection first, with the Recording and Transcript needed to deliver.
     pub async fn delivery_candidates(&self) -> Result<Vec<DeliveryCandidate>, StorageError> {
-        let rows: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+        // (delivery id, last attempt number, last finished_at, retry window).
+        type Row = (String, Option<i64>, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
             "SELECT d.id,
                     (SELECT MAX(attempt_number) FROM delivery_attempts a
                        WHERE a.delivery_id = d.id),
                     (SELECT finished_at FROM delivery_attempts a
                        WHERE a.delivery_id = d.id
-                       ORDER BY attempt_number DESC LIMIT 1)
+                       ORDER BY attempt_number DESC LIMIT 1),
+                    d.retry_window_started_at
              FROM deliveries d
              WHERE d.status = 'delivering'
                AND NOT EXISTS (SELECT 1 FROM delivery_attempts a
@@ -908,7 +1113,7 @@ impl SqliteStore {
         .await?;
 
         let mut candidates = Vec::with_capacity(rows.len());
-        for (delivery_id, last_attempt_number, last_finished) in rows {
+        for (delivery_id, last_attempt_number, last_finished, retry_window) in rows {
             let delivery = self.require_delivery(&delivery_id).await?;
             let recording = self.require_recording(&delivery.recording_id).await?;
             let transcript = self.require_transcript(&delivery.recording_id).await?;
@@ -918,6 +1123,7 @@ impl SqliteStore {
                 transcript,
                 last_attempt_number,
                 last_attempt_finished_at: parse_ts_opt(last_finished)?,
+                retry_window_started_at: parse_ts_opt(retry_window)?,
             });
         }
         Ok(candidates)
@@ -1145,6 +1351,18 @@ async fn set_recording_error(
     Ok(())
 }
 
+/// Clear a Recording's `latest_error` (used when an Operator retries).
+async fn clear_recording_error(
+    conn: &mut SqliteConnection,
+    recording_id: &str,
+) -> Result<(), StorageError> {
+    sqlx::query("UPDATE recordings SET latest_error = NULL WHERE id = ?")
+        .bind(recording_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
 /// Finish an in-flight Transcription Attempt (the row with `finished_at IS NULL`).
 async fn finish_transcription_attempt(
     conn: &mut SqliteConnection,
@@ -1354,6 +1572,35 @@ impl RecordingRow {
             latest_error: self.latest_error,
             created_at: parse_ts(&self.created_at)?,
             updated_at: parse_ts(&self.updated_at)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RecordingSummaryRow {
+    id: String,
+    client_id: String,
+    client_recording_id: String,
+    status: String,
+    tags_json: String,
+    selected_sink_name: Option<String>,
+    latest_error: Option<String>,
+    received_at: String,
+}
+
+impl RecordingSummaryRow {
+    fn into_domain(self) -> Result<RecordingSummary, StorageError> {
+        Ok(RecordingSummary {
+            id: self.id,
+            client_id: self.client_id,
+            client_recording_id: self.client_recording_id,
+            status: RecordingStatus::parse(&self.status)
+                .map_err(|e| StorageError::Corrupt(e.to_string()))?,
+            tags: Tags::from_json(&self.tags_json)
+                .map_err(|e| StorageError::Corrupt(e.to_string()))?,
+            selected_sink_name: self.selected_sink_name,
+            latest_error: self.latest_error,
+            received_at: parse_ts(&self.received_at)?,
         })
     }
 }

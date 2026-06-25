@@ -1,0 +1,153 @@
+{% extends "monitor/base.html" %}
+{% block body %}
+{% include "monitor/_nav.html" %}
+<main>
+<p><a href="/monitor?status=all">&larr; All recordings</a></p>
+<h1>Recording {{ rec.id }}</h1>
+
+<section>
+<h2>Metadata</h2>
+<dl>
+<dt>Status</dt><dd>{{ rec.status }}</dd>
+<dt>Client</dt><dd>{{ rec.client_id }}</dd>
+<dt>Client Recording ID</dt><dd>{{ rec.client_recording_id }}</dd>
+{% if let Some(name) = rec.original_filename %}<dt>Filename</dt><dd>{{ name }}</dd>{% endif %}
+<dt>Received</dt><dd><time>{{ rec.received_at }}</time></dd>
+{% if let Some(t) = rec.recorded_at %}<dt>Recorded</dt><dd><time>{{ t }}</time></dd>{% endif %}
+{% if let Some(n) = rec.audio_size_bytes %}<dt>Size (bytes)</dt><dd>{{ n }}</dd>{% endif %}
+{% if let Some(n) = rec.audio_duration_ms %}<dt>Duration (ms)</dt><dd>{{ n }}</dd>{% endif %}
+{% if let Some(n) = rec.sample_rate_hz %}<dt>Sample rate (Hz)</dt><dd>{{ n }}</dd>{% endif %}
+{% if let Some(n) = rec.channels %}<dt>Channels</dt><dd>{{ n }}</dd>{% endif %}
+{% if let Some(n) = rec.bits_per_sample %}<dt>Bit depth</dt><dd>{{ n }}</dd>{% endif %}
+<dt>Tags</dt><dd>{{ rec.tags }}</dd>
+{% if let Some(err) = rec.latest_error %}<dt>Latest error</dt><dd>{{ err }}</dd>{% endif %}
+</dl>
+</section>
+
+{% if can_manual_route %}
+<section>
+<h2>Manual routing</h2>
+<form method="post" action="/monitor/recordings/{{ rec.id }}/manual-route">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label>Sink
+<select name="sink">
+{% for sink in sinks %}<option value="{{ sink }}">{{ sink }}</option>{% endfor %}
+</select>
+</label>
+<button type="submit">Route</button>
+</form>
+</section>
+{% endif %}
+
+{% if can_retry_transcription %}
+<section>
+<h2>Retry transcription</h2>
+<form method="post" action="/monitor/recordings/{{ rec.id }}/retry-transcription">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button type="submit">Retry transcription</button>
+</form>
+</section>
+{% endif %}
+
+{% if can_retry_delivery %}
+<section>
+<h2>Retry delivery</h2>
+<form method="post" action="/monitor/recordings/{{ rec.id }}/retry-delivery">
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<button type="submit">Retry delivery</button>
+</form>
+</section>
+{% endif %}
+
+{% if let Some(t) = transcript %}
+<section>
+<h2>Transcript</h2>
+<p>Provider: {{ t.provider }}</p>
+<pre>{{ t.text }}</pre>
+<details>
+<summary>Raw provider JSON</summary>
+<pre>{{ t.raw_json }}</pre>
+</details>
+</section>
+{% endif %}
+
+{% if let Some(d) = delivery %}
+<section>
+<h2>Delivery</h2>
+<dl>
+<dt>Sink</dt><dd>{{ d.sink_name }}</dd>
+<dt>Status</dt><dd>{{ d.status }}</dd>
+<dt>Selected</dt><dd><time>{{ d.selected_at }}</time></dd>
+{% if let Some(t) = d.completed_at %}<dt>Completed</dt><dd><time>{{ t }}</time></dd>{% endif %}
+{% if let Some(t) = d.retry_deadline_at %}<dt>Retry deadline</dt><dd><time>{{ t }}</time></dd>{% endif %}
+{% if let Some(err) = d.latest_error %}<dt>Latest error</dt><dd>{{ err }}</dd>{% endif %}
+</dl>
+</section>
+{% endif %}
+
+<section>
+<h2>Transcription attempts</h2>
+{% if transcription_attempts.is_empty() %}
+<p>None.</p>
+{% else %}
+<table>
+<thead><tr><th>#</th><th>Started</th><th>Finished</th><th>Status</th><th>Retryable</th><th>Error</th></tr></thead>
+<tbody>
+{% for a in transcription_attempts %}
+<tr>
+<td>{{ a.attempt_number }}</td>
+<td><time>{{ a.started_at }}</time></td>
+<td>{% if let Some(t) = a.finished_at %}<time>{{ t }}</time>{% endif %}</td>
+<td>{{ a.status }}</td>
+<td>{{ a.retryable }}</td>
+<td>{% if let Some(code) = a.error_code %}{{ code }}: {% endif %}{% if let Some(msg) = a.error_message %}{{ msg }}{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+</section>
+
+{% if !delivery_attempts.is_empty() %}
+<section>
+<h2>Delivery attempts</h2>
+<table>
+<thead><tr><th>#</th><th>Started</th><th>Finished</th><th>Status</th><th>HTTP</th><th>Retryable</th><th>Error</th></tr></thead>
+<tbody>
+{% for a in delivery_attempts %}
+<tr>
+<td>{{ a.attempt_number }}</td>
+<td><time>{{ a.started_at }}</time></td>
+<td>{% if let Some(t) = a.finished_at %}<time>{{ t }}</time>{% endif %}</td>
+<td>{{ a.status }}</td>
+<td>{% if let Some(s) = a.http_status %}{{ s }}{% endif %}</td>
+<td>{{ a.retryable }}</td>
+<td>{% if let Some(msg) = a.error_message %}{{ msg }}{% endif %}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+
+{% if !audit_events.is_empty() %}
+<section>
+<h2>Audit</h2>
+<table>
+<thead><tr><th>Time</th><th>Event</th><th>Actor</th><th>Details</th></tr></thead>
+<tbody>
+{% for e in audit_events %}
+<tr>
+<td><time>{{ e.occurred_at }}</time></td>
+<td>{{ e.event_type }}</td>
+<td>{{ e.actor_kind }}{% if let Some(id) = e.actor_id %} ({{ id }}){% endif %}</td>
+<td>{{ e.details_json }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</section>
+{% endif %}
+
+</main>
+{% endblock %}

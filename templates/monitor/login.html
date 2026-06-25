@@ -1,0 +1,12 @@
+{% extends "monitor/base.html" %}
+{% block body %}
+<main>
+<h1>Telegraph Monitor</h1>
+{% if !error.is_empty() %}<p role="alert">{{ error }}</p>{% endif %}
+<form method="post" action="/monitor/login">
+<label>Username <input type="text" name="username" autocomplete="username"></label>
+<label>Password <input type="password" name="password" autocomplete="current-password"></label>
+<button type="submit">Sign in</button>
+</form>
+</main>
+{% endblock %}

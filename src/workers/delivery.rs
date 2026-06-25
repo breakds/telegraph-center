@@ -95,12 +95,19 @@ pub async fn tick_once<S: SinkClient>(
 }
 
 /// The oldest `delivering` Delivery that is due: its first attempt (due
-/// immediately) or a retry whose backoff has elapsed since the last failure.
+/// immediately), a retry whose backoff has elapsed since the last failure, or an
+/// Operator-opened fresh retry window after the last attempt (Manual Retry),
+/// which is due immediately.
 async fn pick_due_delivery(
     ctx: &WorkerContext<'_>,
     now: OffsetDateTime,
 ) -> Result<Option<DeliveryCandidate>, StorageError> {
     for candidate in ctx.store.delivery_candidates().await? {
+        let manual_retry = candidate.retry_window_started_at.is_some_and(|window| {
+            candidate
+                .last_attempt_finished_at
+                .is_none_or(|finished_at| window > finished_at)
+        });
         let due = match (
             candidate.last_attempt_number,
             candidate.last_attempt_finished_at,
@@ -110,7 +117,7 @@ async fn pick_due_delivery(
             // selected.
             _ => candidate.delivery.selected_at,
         };
-        if now >= due {
+        if manual_retry || now >= due {
             return Ok(Some(candidate));
         }
     }

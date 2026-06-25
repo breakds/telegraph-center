@@ -19,14 +19,17 @@ in
     let
       craneLib = crane.mkLib pkgs-dev;
 
-      # Keep the usual Cargo sources, plus SQL migrations: sqlx::migrate!()
-      # embeds them at compile time, so they must be present in the build src.
+      # Keep the usual Cargo sources, plus SQL migrations and Askama templates:
+      # sqlx::migrate!() and askama both embed these at compile time, so they
+      # must be present in the build src.
       src = lib.cleanSourceWith {
         src = ../.;
         name = "source";
         filter =
           path: type:
-          (lib.hasSuffix ".sql" path) || (craneLib.filterCargoSources path type);
+          (lib.hasSuffix ".sql" path)
+          || (lib.hasSuffix ".html" path)
+          || (craneLib.filterCargoSources path type);
       };
       hasCargoToml = builtins.pathExists ../Cargo.toml;
 
